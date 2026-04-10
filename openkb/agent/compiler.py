@@ -547,7 +547,7 @@ async def _compile_concepts(
     except (json.JSONDecodeError, ValueError) as exc:
         logger.warning("Failed to parse concepts plan: %s", exc)
         logger.debug("Raw: %s", plan_raw)
-        _update_index(wiki_dir, doc_name, [])
+        _update_index(wiki_dir, doc_name, [], doc_brief=doc_brief, doc_type=doc_type)
         return
 
     # Fallback: if LLM returns a flat list, treat all items as "create"
@@ -565,7 +565,7 @@ async def _compile_concepts(
     related_items = plan["related"]
 
     if not create_items and not update_items and not related_items:
-        _update_index(wiki_dir, doc_name, [])
+        _update_index(wiki_dir, doc_name, [], doc_brief=doc_brief, doc_type=doc_type)
         return
 
     # --- Step 3: Generate/update concept pages concurrently (A cached) ---
