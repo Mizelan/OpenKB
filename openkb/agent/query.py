@@ -120,25 +120,47 @@ async def run_query(question: str, kb_dir: Path, model: str, stream: bool = Fals
         result = await Runner.run(agent, question, max_turns=MAX_TURNS)
         return result.final_output or ""
 
+    use_color = sys.stdout.isatty()
+
+    if use_color:
+        from rich.console import Console
+        from rich.live import Live
+        from rich.markdown import Markdown
+        console = Console()
+        live = Live(console=console, vertical_overflow="visible")
+        live.start()
+    else:
+        live = None
+
     result = Runner.run_streamed(agent, question, max_turns=MAX_TURNS)
-    collected = []
-    async for event in result.stream_events():
-        if isinstance(event, RawResponsesStreamEvent):
-            if isinstance(event.data, ResponseTextDeltaEvent):
-                text = event.data.delta
-                if text:
-                    sys.stdout.write(text)
+    collected: list[str] = []
+    try:
+        async for event in result.stream_events():
+            if isinstance(event, RawResponsesStreamEvent):
+                if isinstance(event.data, ResponseTextDeltaEvent):
+                    text = event.data.delta
+                    if text:
+                        collected.append(text)
+                        if live:
+                            live.update(Markdown("".join(collected)))
+                        else:
+                            sys.stdout.write(text)
+                            sys.stdout.flush()
+            elif isinstance(event, RunItemStreamEvent):
+                item = event.item
+                if item.type == "tool_call_item":
+                    raw = item.raw_item
+                    args = getattr(raw, "arguments", "{}")
+                    if live:
+                        live.stop()
+                    sys.stdout.write(f"\n[tool call] {raw.name}({args})\n\n")
                     sys.stdout.flush()
-                    collected.append(text)
-        elif isinstance(event, RunItemStreamEvent):
-            item = event.item
-            if item.type == "tool_call_item":
-                raw = item.raw_item
-                args = getattr(raw, "arguments", "{}")
-                sys.stdout.write(f"\n[tool call] {raw.name}({args})\n\n")
-                sys.stdout.flush()
-            elif item.type == "tool_call_output_item":
-                pass
-    sys.stdout.write("\n")
-    sys.stdout.flush()
+                    if live:
+                        live.start()
+                elif item.type == "tool_call_output_item":
+                    pass
+    finally:
+        if live:
+            live.stop()
+        print()
     return "".join(collected) if collected else result.final_output or ""
