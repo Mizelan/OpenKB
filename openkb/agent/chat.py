@@ -320,6 +320,9 @@ async def _handle_slash(
     parts = cmd.split(maxsplit=1)
     head = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
+    # Strip surrounding quotes (user may type /add '/path/to file')
+    if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in ("'", '"'):
+        arg = arg[1:-1]
 
     if head in ("/exit", "/quit"):
         _fmt(style, ("class:header", "Bye. Thanks for using OpenKB.\n\n"))
