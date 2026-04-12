@@ -223,11 +223,15 @@ class _ChatCompleter(Completer):
                     yield Completion(cmd, start_position=-len(text))
 
 
-def _make_prompt_session(session: ChatSession, style: Style, use_color: bool) -> PromptSession:
+def _make_prompt_session(session: ChatSession, style: Style, use_color: bool, kb_dir: Path) -> PromptSession:
+    from prompt_toolkit.history import FileHistory
+
+    history_path = kb_dir / ".openkb" / "chat_history"
     return PromptSession(
         message=FormattedText([("class:prompt", ">>> ")]),
         style=style,
         completer=_ChatCompleter(),
+        history=FileHistory(str(history_path)),
         bottom_toolbar=(lambda: _bottom_toolbar(session)) if use_color else None,
     )
 
@@ -436,7 +440,7 @@ async def run_chat(
     if session.turn_count > 0:
         _print_resume_view(session, style)
 
-    prompt_session = _make_prompt_session(session, style, use_color)
+    prompt_session = _make_prompt_session(session, style, use_color, kb_dir)
 
     last_sigint = 0.0
 
@@ -467,7 +471,7 @@ async def run_chat(
             if action == "new_session":
                 session = ChatSession.new(kb_dir, session.model, session.language)
                 agent = build_query_agent(wiki_root, session.model, language=language)
-                prompt_session = _make_prompt_session(session, style, use_color)
+                prompt_session = _make_prompt_session(session, style, use_color, kb_dir)
             continue
 
         append_log(kb_dir / "wiki", "query", user_input)
