@@ -219,8 +219,10 @@ class _ChatCompleter(Completer):
         # After "/add ", complete file paths (skip dotfiles)
         if text.lstrip().lower().startswith("/add "):
             path_text = text.lstrip()[5:]
-            # Strip leading quote if user started one
+            # Strip leading quote so PathCompleter resolves the real path
+            quote_char = ""
             if path_text and path_text[0] in ("'", '"'):
+                quote_char = path_text[0]
                 path_text = path_text[1:]
             path_doc = Document(path_text, len(path_text))
             for c in self._path_completer.get_completions(path_doc, complete_event):
@@ -228,7 +230,18 @@ class _ChatCompleter(Completer):
                 basename = c.text.lstrip("/")
                 if basename.startswith(".") and not path_text.rpartition("/")[2].startswith("."):
                     continue
-                yield c
+                # Append closing quote for files; skip for directories so
+                # the user can keep navigating into subdirectories.
+                if quote_char and not c.text.endswith("/"):
+                    comp_text = c.text + quote_char
+                else:
+                    comp_text = c.text
+                yield Completion(
+                    comp_text,
+                    start_position=c.start_position,
+                    display=c.display,
+                    display_meta=c.display_meta,
+                )
             return
 
         # Complete slash commands with descriptions
@@ -409,6 +422,8 @@ async def _handle_slash(
     # Strip surrounding quotes (user may type /add '/path/to file')
     if len(arg) >= 2 and arg[0] == arg[-1] and arg[0] in ("'", '"'):
         arg = arg[1:-1]
+    elif arg and arg[0] in ("'", '"'):
+        arg = arg[1:]
 
     if head in ("/exit", "/quit"):
         _fmt(style, ("class:header", "Bye. Thanks for using OpenKB.\n\n"))
