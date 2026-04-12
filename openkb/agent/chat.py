@@ -189,7 +189,10 @@ def _make_prompt_session(session: ChatSession, style: Style, use_color: bool) ->
     )
 
 
-async def _run_turn(agent: Any, session: ChatSession, user_input: str, style: Style) -> None:
+async def _run_turn(
+    agent: Any, session: ChatSession, user_input: str, style: Style,
+    *, use_color: bool = True,
+) -> None:
     """Run one agent turn with streaming output and persist the new history."""
     from agents import (
         RawResponsesStreamEvent,
@@ -202,11 +205,22 @@ async def _run_turn(agent: Any, session: ChatSession, user_input: str, style: St
 
     result = Runner.run_streamed(agent, new_input, max_turns=MAX_TURNS)
 
-    sys.stdout.write("\n")
-    sys.stdout.flush()
+    print()
     collected: list[str] = []
     last_was_text = False
     need_blank_before_text = False
+
+    if use_color:
+        from rich.console import Console
+        from rich.live import Live
+        from rich.markdown import Markdown
+
+        console = Console()
+        live = Live(console=console, vertical_overflow="visible")
+        live.start()
+    else:
+        live = None
+
     try:
         async for event in result.stream_events():
             if isinstance(event, RawResponsesStreamEvent):
@@ -214,27 +228,44 @@ async def _run_turn(agent: Any, session: ChatSession, user_input: str, style: St
                     text = event.data.delta
                     if text:
                         if need_blank_before_text:
-                            sys.stdout.write("\n")
+                            if live:
+                                live.stop()
+                                print()
+                                live.start()
+                            else:
+                                sys.stdout.write("\n")
                             need_blank_before_text = False
-                        sys.stdout.write(text)
-                        sys.stdout.flush()
                         collected.append(text)
                         last_was_text = True
+                        if live:
+                            live.update(Markdown("".join(collected)))
+                        else:
+                            sys.stdout.write(text)
+                            sys.stdout.flush()
             elif isinstance(event, RunItemStreamEvent):
                 item = event.item
                 if item.type == "tool_call_item":
                     if last_was_text:
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
+                        if live:
+                            live.stop()
+                            live.start()
+                        else:
+                            sys.stdout.write("\n")
+                            sys.stdout.flush()
                         last_was_text = False
                     raw = item.raw_item
                     name = getattr(raw, "name", "?")
                     args = getattr(raw, "arguments", "") or ""
+                    if live:
+                        live.stop()
                     _fmt(style, ("class:tool", _format_tool_line(name, args) + "\n"))
+                    if live:
+                        live.start()
                     need_blank_before_text = True
     finally:
-        sys.stdout.write("\n\n")
-        sys.stdout.flush()
+        if live:
+            live.stop()
+        print("\n")
 
     answer = "".join(collected).strip()
     if not answer:
@@ -371,7 +402,7 @@ async def run_chat(
 
         append_log(kb_dir / "wiki", "query", user_input)
         try:
-            await _run_turn(agent, session, user_input, style)
+            await _run_turn(agent, session, user_input, style, use_color=use_color)
         except KeyboardInterrupt:
             _fmt(style, ("class:error", "\n[aborted]\n"))
         except Exception as exc:
