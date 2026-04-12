@@ -195,26 +195,27 @@ def _make_rich_console() -> Any:
     from rich.theme import Theme
 
     theme = Theme({
-        # Headings: bold, no color (clean and minimal)
-        "markdown.h1":        "bold",
-        "markdown.h2":        "bold",
-        "markdown.h3":        "bold",
-        "markdown.h4":        "bold dim",
-        # Code: dark background, no border
-        "markdown.code":      "bold #c0c0c0 on #1e1e1e",
+        # Headings: bold with blue tint
+        "markdown.h1":        "bold #5fa0e0",
+        "markdown.h2":        "bold #5fa0e0",
+        "markdown.h3":        "bold #7ab0e8",
+        "markdown.h4":        "bold #8abae0",
+        # Code
+        "markdown.code":      "#e8c87a on #1e1e1e",
         # Links
         "markdown.link":      "underline #5fa0e0",
         "markdown.link_url":  "#5fa0e0",
         # Emphasis
-        "markdown.bold":      "bold",
-        "markdown.italic":    "italic",
-        "markdown.strong":    "bold",
+        "markdown.bold":      "bold #e0e0e0",
+        "markdown.italic":    "italic #c0c0c0",
         # Lists and block quotes
-        "markdown.item.bullet":   "#8a8a8a",
-        "markdown.item.number":   "#8a8a8a",
+        "markdown.item.bullet":   "#6ac0a0",
+        "markdown.item.number":   "#6ac0a0",
         "markdown.block_quote":   "italic #8a8a8a",
         # Horizontal rule
         "markdown.hr":        "#4a4a4a",
+        # Paragraphs — ensure normal text is visible
+        "markdown.paragraph":     "#d0d0d0",
     })
     return Console(theme=theme)
 
