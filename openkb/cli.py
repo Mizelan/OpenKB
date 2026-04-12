@@ -525,9 +525,10 @@ def watch(ctx):
     watch_directory(raw_dir, on_new_files)
 
 
-async def run_lint(kb_dir: Path) -> Path:
+async def run_lint(kb_dir: Path) -> Path | None:
     """Run structural + knowledge lint, write report, return report path.
 
+    Returns ``None`` if the KB has no indexed documents (nothing to lint).
     Async because knowledge lint uses an LLM agent. Usable from CLI
     (via ``asyncio.run``) and directly from the chat REPL.
     """
