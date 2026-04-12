@@ -120,17 +120,25 @@ async def run_query(question: str, kb_dir: Path, model: str, stream: bool = Fals
         result = await Runner.run(agent, question, max_turns=MAX_TURNS)
         return result.final_output or ""
 
-    use_color = sys.stdout.isatty()
+    import os
+    use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR", "")
 
     if use_color:
         from rich.console import Console
         from rich.live import Live
         from rich.markdown import Markdown
         console = Console()
-        live = Live(console=console, vertical_overflow="visible")
-        live.start()
     else:
-        live = None
+        console = None  # type: ignore[assignment]
+
+    def _start_live() -> Live | None:
+        if console is None:
+            return None
+        lv = Live(console=console, vertical_overflow="visible")
+        lv.start()
+        return lv
+
+    live = _start_live()
 
     result = Runner.run_streamed(agent, question, max_turns=MAX_TURNS)
     collected: list[str] = []
@@ -153,10 +161,10 @@ async def run_query(question: str, kb_dir: Path, model: str, stream: bool = Fals
                     args = getattr(raw, "arguments", "{}")
                     if live:
                         live.stop()
+                        live = None
                     sys.stdout.write(f"\n[tool call] {raw.name}({args})\n\n")
                     sys.stdout.flush()
-                    if live:
-                        live.start()
+                    live = _start_live()
                 elif item.type == "tool_call_output_item":
                     pass
     finally:

@@ -216,10 +216,17 @@ async def _run_turn(
         from rich.markdown import Markdown
 
         console = Console()
-        live = Live(console=console, vertical_overflow="visible")
-        live.start()
     else:
-        live = None
+        console = None  # type: ignore[assignment]
+
+    def _start_live() -> Any:
+        if console is None:
+            return None
+        lv = Live(console=console, vertical_overflow="visible")
+        lv.start()
+        return lv
+
+    live = _start_live()
 
     try:
         async for event in result.stream_events():
@@ -230,8 +237,9 @@ async def _run_turn(
                         if need_blank_before_text:
                             if live:
                                 live.stop()
+                                live = None
                                 print()
-                                live.start()
+                                live = _start_live()
                             else:
                                 sys.stdout.write("\n")
                             need_blank_before_text = False
@@ -248,7 +256,7 @@ async def _run_turn(
                     if last_was_text:
                         if live:
                             live.stop()
-                            live.start()
+                            live = None
                         else:
                             sys.stdout.write("\n")
                             sys.stdout.flush()
@@ -258,14 +266,14 @@ async def _run_turn(
                     args = getattr(raw, "arguments", "") or ""
                     if live:
                         live.stop()
+                        live = None
                     _fmt(style, ("class:tool", _format_tool_line(name, args) + "\n"))
-                    if live:
-                        live.start()
+                    live = _start_live()
                     need_blank_before_text = True
     finally:
         if live:
             live.stop()
-        print("\n")
+        print()
 
     answer = "".join(collected).strip()
     if not answer:
