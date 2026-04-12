@@ -7,6 +7,7 @@ stdout to preserve the existing ``query`` visual.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import sys
@@ -277,8 +278,7 @@ def _save_transcript(kb_dir: Path, session: ChatSession, name: str | None) -> Pa
 
 async def _run_add(arg: str, kb_dir: Path, style: Style) -> None:
     """Add a document or directory to the knowledge base from the chat REPL."""
-    import asyncio
-    from openkb.cli import _add_single_file, SUPPORTED_EXTENSIONS
+    from openkb.cli import add_single_file, SUPPORTED_EXTENSIONS
 
     target = Path(arg).expanduser()
     if not target.is_absolute():
@@ -297,13 +297,16 @@ async def _run_add(arg: str, kb_dir: Path, style: Style) -> None:
         if not files:
             _fmt(style, ("class:error", f"No supported files found in {arg}.\n"))
             return
-        for f in files:
-            await asyncio.to_thread(_add_single_file, f, kb_dir)
+        total = len(files)
+        _fmt(style, ("class:slash.help", f"Found {total} supported file(s) in {arg}.\n"))
+        for i, f in enumerate(files, 1):
+            _fmt(style, ("class:slash.help", f"\n[{i}/{total}] "))
+            await asyncio.to_thread(add_single_file, f, kb_dir)
     else:
         if target.suffix.lower() not in SUPPORTED_EXTENSIONS:
             _fmt(style, ("class:error", f"Unsupported file type: {target.suffix}\n"))
             return
-        await asyncio.to_thread(_add_single_file, target, kb_dir)
+        await asyncio.to_thread(add_single_file, target, kb_dir)
 
 
 async def _handle_slash(

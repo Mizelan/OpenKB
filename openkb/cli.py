@@ -128,7 +128,7 @@ def _find_kb_dir(override: Path | None = None) -> Path | None:
     return None
 
 
-def _add_single_file(file_path: Path, kb_dir: Path) -> None:
+def add_single_file(file_path: Path, kb_dir: Path) -> None:
     """Convert, index, and compile a single document into the knowledge base.
 
     Steps:
@@ -346,7 +346,7 @@ def add(ctx, path):
         click.echo(f"Found {total} supported file(s) in {path}.")
         for i, f in enumerate(files, 1):
             click.echo(f"\n[{i}/{total}] ", nl=False)
-            _add_single_file(f, kb_dir)
+            add_single_file(f, kb_dir)
     else:
         if target.suffix.lower() not in SUPPORTED_EXTENSIONS:
             click.echo(
@@ -354,7 +354,7 @@ def add(ctx, path):
                 f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
             )
             return
-        _add_single_file(target, kb_dir)
+        add_single_file(target, kb_dir)
 
 
 @cli.command()
@@ -519,7 +519,7 @@ def watch(ctx):
                     f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
                 )
                 continue
-            _add_single_file(fp, kb_dir)
+            add_single_file(fp, kb_dir)
 
     click.echo(f"Watching {raw_dir} for new documents. Press Ctrl+C to stop.")
     watch_directory(raw_dir, on_new_files)
