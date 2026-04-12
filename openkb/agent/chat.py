@@ -239,7 +239,24 @@ class _ChatCompleter(Completer):
 
 
 def _make_prompt_session(session: ChatSession, style: Style, use_color: bool, kb_dir: Path) -> PromptSession:
+    from prompt_toolkit.filters import has_completions
     from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.key_binding import KeyBindings
+
+    kb = KeyBindings()
+
+    @kb.add("tab", filter=has_completions)
+    def _accept_completion(event: Any) -> None:
+        """Tab accepts the current completion (like zsh), not cycle."""
+        buf = event.current_buffer
+        if buf.complete_state:
+            buf.apply_completion(buf.complete_state.current_completion)
+
+    @kb.add("tab", filter=~has_completions)
+    def _trigger_completion(event: Any) -> None:
+        """Tab triggers completion when menu is not open."""
+        buf = event.current_buffer
+        buf.start_completion()
 
     history_path = kb_dir / ".openkb" / "chat_history"
     return PromptSession(
@@ -248,6 +265,7 @@ def _make_prompt_session(session: ChatSession, style: Style, use_color: bool, kb
         completer=_ChatCompleter(),
         complete_style=CompleteStyle.MULTI_COLUMN,
         complete_while_typing=False,
+        key_bindings=kb,
         history=FileHistory(str(history_path)),
         bottom_toolbar=(lambda: _bottom_toolbar(session)) if use_color else None,
     )
