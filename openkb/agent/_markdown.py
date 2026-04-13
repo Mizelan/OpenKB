@@ -20,9 +20,11 @@ INLINE_CODE_STYLE = "blue"
 BLOCKQUOTE_BAR = "\u258e"
 
 
+_MD = MarkdownIt("commonmark").enable("table")
+
+
 def render(content: str) -> RenderableType:
-    md = MarkdownIt("commonmark").enable("table")
-    tokens = md.parse(content)
+    tokens = _MD.parse(content)
     tree = SyntaxTreeNode(tokens)
 
     blocks: list[RenderableType] = []

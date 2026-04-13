@@ -153,7 +153,11 @@ async def run_query(question: str, kb_dir: Path, model: str, stream: bool = Fals
                         if console is not None:
                             if live is None:
                                 live = _start_live()
-                            live.update(_make_markdown("".join(segment)))
+                            if "\n" in text:
+                                joined = "".join(segment)
+                                visible = joined[: joined.rfind("\n") + 1]
+                                if visible:
+                                    live.update(_make_markdown(visible))
                         else:
                             sys.stdout.write(text)
                             sys.stdout.flush()
@@ -163,6 +167,8 @@ async def run_query(question: str, kb_dir: Path, model: str, stream: bool = Fals
                     raw = item.raw_item
                     args = getattr(raw, "arguments", "{}")
                     if live:
+                        if segment:
+                            live.update(_make_markdown("".join(segment)))
                         live.stop()
                         live = None
                     sys.stdout.write(f"\n[tool call] {raw.name}({args})\n\n")
@@ -172,6 +178,8 @@ async def run_query(question: str, kb_dir: Path, model: str, stream: bool = Fals
                     pass
     finally:
         if live:
+            if segment:
+                live.update(_make_markdown("".join(segment)))
             live.stop()
         print()
     return "".join(collected) if collected else result.final_output or ""

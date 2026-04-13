@@ -258,7 +258,11 @@ async def _run_turn(
                         segment.append(text)
                         last_was_text = True
                         if live:
-                            live.update(_make_markdown("".join(segment)))
+                            if "\n" in text:
+                                joined = "".join(segment)
+                                visible = joined[: joined.rfind("\n") + 1]
+                                if visible:
+                                    live.update(_make_markdown(visible))
                         else:
                             sys.stdout.write(text)
                             sys.stdout.flush()
@@ -267,6 +271,8 @@ async def _run_turn(
                 if item.type == "tool_call_item":
                     if last_was_text:
                         if live:
+                            if segment:
+                                live.update(_make_markdown("".join(segment)))
                             live.stop()
                             live = None
                         else:
@@ -283,6 +289,8 @@ async def _run_turn(
                     need_blank_before_text = True
     finally:
         if live:
+            if segment:
+                live.update(_make_markdown("".join(segment)))
             live.stop()
         print()
 
