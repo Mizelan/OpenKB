@@ -203,7 +203,7 @@ def _make_markdown(text: str) -> Any:
 
 async def _run_turn(
     agent: Any, session: ChatSession, user_input: str, style: Style,
-    *, use_color: bool = True,
+    *, use_color: bool = True, raw: bool = False,
 ) -> None:
     """Run one agent turn with streaming output and persist the new history."""
     from agents import (
@@ -223,7 +223,7 @@ async def _run_turn(
     last_was_text = False
     need_blank_before_text = False
 
-    if use_color:
+    if use_color and not raw:
         from rich.console import Console
         from rich.live import Live
 
@@ -377,6 +377,7 @@ async def run_chat(
     session: ChatSession,
     *,
     no_color: bool = False,
+    raw: bool = False,
 ) -> None:
     """Run the chat REPL against ``session`` until the user exits."""
     from openkb.config import load_config
@@ -429,7 +430,7 @@ async def run_chat(
 
         append_log(kb_dir / "wiki", "query", user_input)
         try:
-            await _run_turn(agent, session, user_input, style, use_color=use_color)
+            await _run_turn(agent, session, user_input, style, use_color=use_color, raw=raw)
         except KeyboardInterrupt:
             _fmt(style, ("class:error", "\n[aborted]\n"))
         except Exception as exc:

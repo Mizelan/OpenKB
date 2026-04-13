@@ -91,7 +91,14 @@ def build_query_agent(wiki_root: str, model: str, language: str = "en") -> Agent
     )
 
 
-async def run_query(question: str, kb_dir: Path, model: str, stream: bool = False) -> str:
+async def run_query(
+    question: str,
+    kb_dir: Path,
+    model: str,
+    stream: bool = False,
+    *,
+    raw: bool = False,
+) -> str:
     """Run a Q&A query against the knowledge base.
 
     Args:
@@ -99,6 +106,8 @@ async def run_query(question: str, kb_dir: Path, model: str, stream: bool = Fals
         kb_dir: Root of the knowledge base.
         model: LLM model name.
         stream: If True, print response tokens to stdout as they arrive.
+        raw: If True, write raw markdown source instead of rendering it
+            (still keeps tool-call line styling).
 
     Returns:
         The agent's final answer as a string.
@@ -133,8 +142,9 @@ async def run_query(question: str, kb_dir: Path, model: str, stream: bool = Fals
 
     style = _build_style(use_color)
 
-    if use_color:
-        from rich.live import Live
+    from rich.live import Live
+
+    if use_color and not raw:
         console = _make_rich_console()
     else:
         console = None  # type: ignore[assignment]
