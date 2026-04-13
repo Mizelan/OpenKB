@@ -123,9 +123,18 @@ async def run_query(question: str, kb_dir: Path, model: str, stream: bool = Fals
     import os
     use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR", "")
 
+    from openkb.agent.chat import (
+        _build_style,
+        _fmt,
+        _format_tool_line,
+        _make_markdown,
+        _make_rich_console,
+    )
+
+    style = _build_style(use_color)
+
     if use_color:
         from rich.live import Live
-        from openkb.agent.chat import _make_markdown, _make_rich_console
         console = _make_rich_console()
     else:
         console = None  # type: ignore[assignment]
@@ -164,14 +173,18 @@ async def run_query(question: str, kb_dir: Path, model: str, stream: bool = Fals
             elif isinstance(event, RunItemStreamEvent):
                 item = event.item
                 if item.type == "tool_call_item":
-                    raw = item.raw_item
-                    args = getattr(raw, "arguments", "{}")
+                    raw_item = item.raw_item
+                    name = getattr(raw_item, "name", "?")
+                    args = getattr(raw_item, "arguments", "") or ""
                     if live:
                         if segment:
                             live.update(_make_markdown("".join(segment)))
                         live.stop()
                         live = None
-                    sys.stdout.write(f"\n[tool call] {raw.name}({args})\n\n")
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    _fmt(style, ("class:tool", _format_tool_line(name, args) + "\n"))
+                    sys.stdout.write("\n")
                     sys.stdout.flush()
                     segment = []
                 elif item.type == "tool_call_output_item":
