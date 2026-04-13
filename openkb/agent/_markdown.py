@@ -118,7 +118,13 @@ def _append_inline(node: Any, out: Text) -> None:
         for child in node.children or []:
             _append_inline(child, piece)
         if href.startswith("mailto:"):
-            out.append(href[len("mailto:") :])
+            email = href[len("mailto:") :]
+            plain = piece.plain
+            if plain and plain != email and plain != href:
+                piece.stylize(f"link {href}")
+                out.append_text(piece)
+            else:
+                out.append(email, style=f"link {href}")
             return
         if href:
             plain = piece.plain
@@ -140,6 +146,18 @@ def _append_inline(node: Any, out: Text) -> None:
             out.append(content)
 
 
+def _append_with_cont_indent(target: Text, source: Text, cont_indent: str) -> None:
+    lines = source.split("\n", allow_blank=True)
+    for i, line in enumerate(lines):
+        if i > 0:
+            target.append("\n" + cont_indent)
+        target.append_text(line)
+
+
+def _render_code_as_text(node: Any) -> Text:
+    return Text(node.content.rstrip("\n"), style="dim")
+
+
 def _render_list(node: Any, ordered: bool, depth: int) -> Text:
     result = Text()
     items = list(node.children)
@@ -152,6 +170,7 @@ def _render_list(node: Any, ordered: bool, depth: int) -> Text:
 
     for i, item in enumerate(items):
         indent = "  " * depth
+        cont = indent + "  "
         if ordered:
             prefix = f"{_list_number(depth, start + i)}. "
         else:
@@ -161,8 +180,8 @@ def _render_list(node: Any, ordered: bool, depth: int) -> Text:
         for child in item.children or []:
             if child.type == "paragraph":
                 if not first:
-                    result.append("\n" + indent + "  ")
-                result.append_text(_render_inline_container(child))
+                    result.append("\n" + cont)
+                _append_with_cont_indent(result, _render_inline_container(child), cont)
                 first = False
             elif child.type in ("bullet_list", "ordered_list"):
                 result.append("\n")
@@ -173,16 +192,19 @@ def _render_list(node: Any, ordered: bool, depth: int) -> Text:
                         depth=depth + 1,
                     )
                 )
+            elif child.type in ("fence", "code_block"):
+                if not first:
+                    result.append("\n" + cont)
+                _append_with_cont_indent(result, _render_code_as_text(child), cont)
+                first = False
             else:
                 rendered = _render_block(child)
                 if rendered is None:
                     continue
                 if not first:
-                    result.append("\n" + indent + "  ")
+                    result.append("\n" + cont)
                 if isinstance(rendered, Text):
-                    result.append_text(rendered)
-                else:
-                    result.append(str(rendered))
+                    _append_with_cont_indent(result, rendered, cont)
                 first = False
         if i < len(items) - 1:
             result.append("\n")
@@ -237,11 +259,12 @@ def _to_roman(n: int) -> str:
 def _render_blockquote(node: Any) -> Text:
     inner_blocks: list[Text] = []
     for child in node.children or []:
+        if child.type in ("fence", "code_block"):
+            inner_blocks.append(_render_code_as_text(child))
+            continue
         rendered = _render_block(child)
         if isinstance(rendered, Text):
             inner_blocks.append(rendered)
-        elif rendered is not None:
-            inner_blocks.append(Text(str(rendered)))
 
     combined = Text()
     for i, block in enumerate(inner_blocks):
