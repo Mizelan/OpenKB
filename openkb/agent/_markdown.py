@@ -53,7 +53,8 @@ def _render_block(node: Any) -> RenderableType | None:
     if t == "paragraph":
         return _render_inline_container(node)
     if t == "fence":
-        lang = (node.info or "").strip().split()[0] if node.info else ""
+        info_parts = (node.info or "").strip().split()
+        lang = info_parts[0] if info_parts else ""
         return Syntax(
             node.content.rstrip("\n"),
             lang or "text",
