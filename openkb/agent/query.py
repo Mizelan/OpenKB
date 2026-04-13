@@ -137,12 +137,12 @@ async def run_query(question: str, kb_dir: Path, model: str, stream: bool = Fals
         lv.start()
         return lv
 
-    live = _start_live()
-
+    live: Live | None = None
     result = Runner.run_streamed(agent, question, max_turns=MAX_TURNS)
     collected: list[str] = []
     segment: list[str] = []
     try:
+        live = _start_live()
         async for event in result.stream_events():
             if isinstance(event, RawResponsesStreamEvent):
                 if isinstance(event.data, ResponseTextDeltaEvent):
@@ -150,7 +150,9 @@ async def run_query(question: str, kb_dir: Path, model: str, stream: bool = Fals
                     if text:
                         collected.append(text)
                         segment.append(text)
-                        if live:
+                        if console is not None:
+                            if live is None:
+                                live = _start_live()
                             live.update(_make_markdown("".join(segment)))
                         else:
                             sys.stdout.write(text)
@@ -166,7 +168,6 @@ async def run_query(question: str, kb_dir: Path, model: str, stream: bool = Fals
                     sys.stdout.write(f"\n[tool call] {raw.name}({args})\n\n")
                     sys.stdout.flush()
                     segment = []
-                    live = _start_live()
                 elif item.type == "tool_call_output_item":
                     pass
     finally:
