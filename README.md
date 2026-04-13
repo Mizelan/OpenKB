@@ -148,8 +148,8 @@ A single source might touch 10-15 wiki pages. Knowledge accumulates: each docume
 | Command | Description |
 |---|---|
 | `openkb init` | Initialize a new knowledge base (interactive) |
-| `openkb add <file_or_dir>` | Add documents and compile to wiki |
-| `openkb query "question"` | Ask a question against the knowledge base (use `--save` to save the answer to `wiki/explorations/`) |
+| <code>openkb&nbsp;add&nbsp;&lt;file_or_dir&gt;</code> | Add documents and compile to wiki |
+| <code>openkb&nbsp;query&nbsp;"question"</code> | Ask a question over the knowledge base (use `--save` to save the answer to `wiki/explorations/`) |
 | `openkb chat` | Start an interactive multi-turn chat (use `--resume`, `--list`, `--delete` to manage sessions) |
 | `openkb watch` | Watch `raw/` and auto-compile new files |
 | `openkb lint` | Run structural + knowledge health checks |
