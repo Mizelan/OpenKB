@@ -142,6 +142,7 @@ async def run_query(question: str, kb_dir: Path, model: str, stream: bool = Fals
 
     result = Runner.run_streamed(agent, question, max_turns=MAX_TURNS)
     collected: list[str] = []
+    segment: list[str] = []
     try:
         async for event in result.stream_events():
             if isinstance(event, RawResponsesStreamEvent):
@@ -149,8 +150,9 @@ async def run_query(question: str, kb_dir: Path, model: str, stream: bool = Fals
                     text = event.data.delta
                     if text:
                         collected.append(text)
+                        segment.append(text)
                         if live:
-                            live.update(Markdown("".join(collected), code_theme="monokai"))
+                            live.update(Markdown("".join(segment), code_theme="monokai"))
                         else:
                             sys.stdout.write(text)
                             sys.stdout.flush()
@@ -164,6 +166,7 @@ async def run_query(question: str, kb_dir: Path, model: str, stream: bool = Fals
                         live = None
                     sys.stdout.write(f"\n[tool call] {raw.name}({args})\n\n")
                     sys.stdout.flush()
+                    segment = []
                     live = _start_live()
                 elif item.type == "tool_call_output_item":
                     pass

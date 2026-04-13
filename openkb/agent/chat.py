@@ -238,6 +238,7 @@ async def _run_turn(
 
     print()
     collected: list[str] = []
+    segment: list[str] = []
     last_was_text = False
     need_blank_before_text = False
 
@@ -266,18 +267,18 @@ async def _run_turn(
                     text = event.data.delta
                     if text:
                         if need_blank_before_text:
-                            if live:
-                                live.stop()
-                                live = None
+                            if console is not None:
                                 print()
+                                segment = []
                                 live = _start_live()
                             else:
                                 sys.stdout.write("\n")
                             need_blank_before_text = False
                         collected.append(text)
+                        segment.append(text)
                         last_was_text = True
                         if live:
-                            live.update(Markdown("".join(collected), code_theme="monokai"))
+                            live.update(Markdown("".join(segment), code_theme="monokai"))
                         else:
                             sys.stdout.write(text)
                             sys.stdout.flush()
@@ -299,7 +300,6 @@ async def _run_turn(
                         live.stop()
                         live = None
                     _fmt(style, ("class:tool", _format_tool_line(name, args) + "\n"))
-                    live = _start_live()
                     need_blank_before_text = True
     finally:
         if live:
