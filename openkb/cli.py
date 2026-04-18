@@ -30,6 +30,7 @@ from openkb.converter import convert_document
 from openkb.log import append_log
 from openkb.schema import AGENTS_MD
 from openkb.agent.compiler import _make_index_template
+from openkb.review import ReviewQueue
 
 # Suppress warnings after all imports — markitdown overrides filters at import time
 import warnings
@@ -712,6 +713,50 @@ def print_status(kb_dir: Path) -> None:
             import datetime
             mtime = datetime.datetime.fromtimestamp(newest_report.stat().st_mtime)
             click.echo(f"  Last lint:     {mtime.strftime('%Y-%m-%d %H:%M:%S')}")
+
+
+@cli.command()
+@click.option("--accept", "accept_idx", type=int, default=None, help="Accept and remove the item at the given index.")
+@click.option("--skip", "skip_idx", type=int, default=None, help="Skip and remove the item at the given index.")
+@click.pass_context
+def review(ctx, accept_idx, skip_idx):
+    """Review pending items from the analysis step."""
+    kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
+    if kb_dir is None:
+        click.echo("No knowledge base found. Run `openkb init` first.")
+        return
+
+    openkb_dir = kb_dir / ".openkb"
+    queue = ReviewQueue(openkb_dir)
+    items = queue.list()
+
+    if accept_idx is not None:
+        if not items or accept_idx < 0 or accept_idx >= len(items):
+            click.echo("Invalid index. No item at that position.")
+            return
+        item = queue.accept(accept_idx)
+        click.echo(f"Accepted: [{item.type}] {item.title}\n  {item.description}")
+        return
+
+    if skip_idx is not None:
+        if not items or skip_idx < 0 or skip_idx >= len(items):
+            click.echo("Invalid index. No item at that position.")
+            return
+        queue.skip(skip_idx)
+        click.echo(f"Skipped item at index {skip_idx}.")
+        return
+
+    if not items:
+        click.echo("No pending review items.")
+        return
+
+    click.echo(f"Pending review items ({len(items)}):\n")
+    for i, item in enumerate(items):
+        click.echo(f"  [{i}] ({item.type}) {item.title}")
+        click.echo(f"      {item.description}")
+        if item.affected_pages:
+            click.echo(f"      Affected: {', '.join(item.affected_pages)}")
+        click.echo()
 
 
 @cli.command()

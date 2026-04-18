@@ -19,6 +19,7 @@ import unicodedata
 from pathlib import Path
 
 from openkb.schema import get_agents_md
+from openkb.review import ReviewItem, parse_review_blocks, ReviewQueue
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,33 @@ Return a JSON object with two keys:
 - "content": The full summary in Markdown. Include key concepts, findings, ideas, \
 and [[wikilinks]] to concepts that could become cross-document concept pages
 
+Return ONLY valid JSON, no fences.
+"""
+
+_ANALYSIS_USER = """\
+Analyze this document against the existing wiki concepts.
+
+Existing concept pages:
+{concept_briefs}
+
+Document content:
+{content}
+
+Return a JSON object with three keys:
+
+1. "entities" — key entities mentioned in the document. Array of objects:
+   {{"name": "entity-name", "type": "person|organization|technology|concept|event|location|work"}}
+
+2. "concept_actions" — how this document relates to existing concepts and what new ones to create. Array of objects:
+   {{"action": "create|update|skip", "name": "concept-slug", "reason": "brief justification"}}
+
+3. "review_items" — issues or suggestions that need human review before proceeding. Array of objects:
+   {{"type": "contradiction|duplicate|missing_page|confirm|suggestion", \
+"title": "short title", "description": "what needs review", \
+"source_path": "path in wiki", "affected_pages": ["list of pages"], \
+"search_queries": ["queries to find related info"], "options": [{{"action": "create|merge|skip"}}]}}
+
+Be conservative with review_items — only flag genuine conflicts, duplicates, or gaps.
 Return ONLY valid JSON, no fences.
 """
 
@@ -447,6 +475,59 @@ def _sanitize_concept_name(name: str) -> str:
     return sanitized or "unnamed-concept"
 
 
+# ---------------------------------------------------------------------------
+# Analysis step
+# ---------------------------------------------------------------------------
+
+
+def _analyze_document(
+    model: str,
+    system_msg: dict,
+    doc_msg: dict,
+    concept_briefs: str,
+) -> dict:
+    """Run the analysis step and return entities, concept_actions, and review_items.
+
+    Returns a dict with keys: entities, concept_actions, review_items.
+    On failure (bad JSON, LLM error), returns empty defaults.
+    """
+    analysis_raw = _llm_call(model, [
+        system_msg,
+        doc_msg,
+        {"role": "user", "content": _ANALYSIS_USER.format(
+            concept_briefs=concept_briefs,
+            content=doc_msg["content"],
+        )},
+    ], "analysis")
+
+    try:
+        parsed = _parse_json(analysis_raw)
+        if not isinstance(parsed, dict):
+            logger.warning("Analysis response was not a dict, using defaults")
+            return {"entities": [], "concept_actions": [], "review_items": []}
+    except (json.JSONDecodeError, ValueError) as exc:
+        logger.warning("Failed to parse analysis response: %s", exc)
+        return {"entities": [], "concept_actions": [], "review_items": []}
+
+    entities = parsed.get("entities", [])
+    concept_actions = parsed.get("concept_actions", [])
+    raw_review_items = parsed.get("review_items", [])
+
+    # Parse review items through ReviewItem for validation
+    review_items: list[ReviewItem] = []
+    for raw in raw_review_items:
+        try:
+            review_items.append(ReviewItem.from_dict(raw))
+        except (KeyError, ValueError) as exc:
+            logger.warning("Skipping invalid review item from analysis: %s", exc)
+
+    return {
+        "entities": entities,
+        "concept_actions": concept_actions,
+        "review_items": review_items,
+    }
+
+
 def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is_update: bool, brief: str = "", entity_type: str = "") -> None:
     """Write or update a concept page, managing the sources frontmatter."""
     concepts_dir = wiki_dir / "concepts"
@@ -698,24 +779,35 @@ async def _compile_concepts(
     doc_brief: str = "",
     doc_type: str = "short",
     language: str = "en",
+    analysis_context: dict | None = None,
 ) -> None:
     """Shared Steps 2-4: concepts plan → generate/update → index.
 
     Uses ``_CONCEPTS_PLAN_USER`` to get a plan with create/update/related
     actions, then executes each action type accordingly.
+
+    If *analysis_context* is provided, concept_actions from the analysis
+    step are injected as prior context into the concept plan prompt.
     """
     source_file = f"summaries/{doc_name}.md"
 
     # --- Step 2: Get concepts plan (A cached) ---
     concept_briefs = _read_concept_briefs(wiki_dir)
 
+    # Build concept plan prompt, optionally with analysis context
+    plan_prompt = _CONCEPTS_PLAN_USER.format(concept_briefs=concept_briefs)
+    if analysis_context and analysis_context.get("concept_actions"):
+        actions_text = "\n".join(
+            f"- {a.get('action', '?')}: {a.get('name', '?')} — {a.get('reason', '')}"
+            for a in analysis_context["concept_actions"]
+        )
+        plan_prompt = f"Prior analysis suggests the following concept actions:\n{actions_text}\n\n{plan_prompt}"
+
     plan_raw = _llm_call(model, [
         system_msg,
         doc_msg,
         {"role": "assistant", "content": summary},
-        {"role": "user", "content": _CONCEPTS_PLAN_USER.format(
-            concept_briefs=concept_briefs,
-        )},
+        {"role": "user", "content": plan_prompt},
     ], "concepts-plan", max_tokens=1024)
 
     try:
@@ -736,9 +828,10 @@ async def _compile_concepts(
             "related": parsed.get("related", []),
         }
 
-    create_items = plan["create"]
-    update_items = plan["update"]
-    related_items = plan["related"]
+    # Filter out non-dict items from create/update lists (LLM may return malformed items)
+    create_items = [c for c in plan["create"] if isinstance(c, dict)]
+    update_items = [c for c in plan["update"] if isinstance(c, dict)]
+    related_items = [r for r in plan["related"] if isinstance(r, str)]
 
     if not create_items and not update_items and not related_items:
         _update_index(wiki_dir, doc_name, [], doc_brief=doc_brief, doc_type=doc_type, language=language)
@@ -876,6 +969,22 @@ async def compile_short_doc(
         doc_name=doc_name, content=content,
     )}
 
+    # --- Step 0: Analysis step ---
+    concept_briefs = _read_concept_briefs(wiki_dir)
+    analysis = _analyze_document(
+        model=model,
+        system_msg=system_msg,
+        doc_msg=doc_msg,
+        concept_briefs=concept_briefs,
+    )
+
+    # Save review items to queue
+    review_items = analysis.get("review_items", [])
+    if review_items:
+        openkb_dir = kb_dir / ".openkb"
+        queue = ReviewQueue(openkb_dir)
+        queue.add(review_items)
+
     # --- Step 1: Generate summary ---
     summary_raw = _llm_call(model, [system_msg, doc_msg], "summary")
     try:
@@ -892,6 +1001,7 @@ async def compile_short_doc(
         wiki_dir, kb_dir, model, system_msg, doc_msg,
         summary, doc_name, max_concurrency, doc_brief=doc_brief,
         doc_type="short", language=language,
+        analysis_context=analysis if analysis.get("concept_actions") else None,
     )
 
 
@@ -927,6 +1037,22 @@ async def compile_long_doc(
         doc_name=doc_name, doc_id=doc_id, content=summary_content,
     )}
 
+    # --- Step 0: Analysis step ---
+    concept_briefs = _read_concept_briefs(wiki_dir)
+    analysis = _analyze_document(
+        model=model,
+        system_msg=system_msg,
+        doc_msg=doc_msg,
+        concept_briefs=concept_briefs,
+    )
+
+    # Save review items to queue
+    review_items = analysis.get("review_items", [])
+    if review_items:
+        openkb_dir = kb_dir / ".openkb"
+        queue = ReviewQueue(openkb_dir)
+        queue.add(review_items)
+
     # --- Step 1: Generate overview ---
     overview = _llm_call(model, [system_msg, doc_msg], "overview")
 
@@ -935,4 +1061,5 @@ async def compile_long_doc(
         wiki_dir, kb_dir, model, system_msg, doc_msg,
         overview, doc_name, max_concurrency, doc_brief=doc_description,
         doc_type="pageindex", language=language,
+        analysis_context=analysis if analysis.get("concept_actions") else None,
     )

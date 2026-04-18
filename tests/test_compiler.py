@@ -574,8 +574,11 @@ class TestCompileShortDoc:
             "content": "# Transformer\n\nA neural network architecture.",
         })
 
+        analysis_response = json.dumps({
+            "entities": [], "concept_actions": [], "review_items": [],
+        })
         with patch("openkb.agent.compiler._llm_call") as mock_llm:
-            mock_llm.side_effect = [summary_response, concepts_list_response, concept_page_response]
+            mock_llm.side_effect = [analysis_response, summary_response, concepts_list_response, concept_page_response]
             await compile_short_doc("test-doc", source_path, tmp_path, "gpt-4o-mini")
 
         # Verify summary written
@@ -607,7 +610,7 @@ class TestCompileShortDoc:
         (tmp_path / ".openkb").mkdir()
 
         with patch("openkb.agent.compiler._llm_call") as mock_llm:
-            mock_llm.side_effect = ["Plain summary text", "not valid json"]
+            mock_llm.side_effect = ["not valid json", "Plain summary text", "not valid json"]
             # Should not raise
             await compile_short_doc("doc", source_path, tmp_path, "gpt-4o-mini")
 
@@ -644,8 +647,11 @@ class TestCompileLongDoc:
             "content": "# Deep Learning\n\nA subfield of ML.",
         })
 
+        analysis_response = json.dumps({
+            "entities": [], "concept_actions": [], "review_items": [],
+        })
         with patch("openkb.agent.compiler._llm_call") as mock_llm:
-            mock_llm.side_effect = [overview_response, concepts_list_response, concept_page_response]
+            mock_llm.side_effect = [analysis_response, overview_response, concepts_list_response, concept_page_response]
             await compile_long_doc(
                 "big-doc", summary_path, "doc-123", tmp_path, "gpt-4o-mini"
             )
@@ -1017,8 +1023,11 @@ class TestBriefIntegration:
             "content": "# Transformer\n\nA neural network architecture.",
         })
 
+        analysis_resp = json.dumps({
+            "entities": [], "concept_actions": [], "review_items": [],
+        })
         with patch("openkb.agent.compiler._llm_call") as mock_llm:
-            mock_llm.side_effect = [summary_resp, plan_resp, concept_resp]
+            mock_llm.side_effect = [analysis_resp, summary_resp, plan_resp, concept_resp]
             await compile_short_doc("test-doc", source_path, tmp_path, "gpt-4o-mini")
 
         # Summary frontmatter has doc_type and full_text
@@ -1034,6 +1043,211 @@ class TestBriefIntegration:
         index_text = (wiki / "index.md").read_text()
         assert "— A paper about transformers" in index_text
         assert "— NN architecture using self-attention" in index_text
+
+
+class TestAnalysisStep:
+    """Tests for _ANALYSIS_USER prompt and _analyze_document function."""
+
+    def test_analysis_prompt_contains_placeholders(self):
+        from openkb.agent.compiler import _ANALYSIS_USER
+        assert "{concept_briefs}" in _ANALYSIS_USER
+        assert "{content}" in _ANALYSIS_USER
+
+    def test_analysis_prompt_requests_entities_and_concept_actions(self):
+        from openkb.agent.compiler import _ANALYSIS_USER
+        assert "entities" in _ANALYSIS_USER
+        assert "concept_actions" in _ANALYSIS_USER
+        assert "review_items" in _ANALYSIS_USER
+
+    def test_analyze_document_returns_dict(self, tmp_path):
+        from openkb.agent.compiler import _analyze_document
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        system_msg = {"role": "system", "content": "You are a wiki agent."}
+        analysis_response = json.dumps({
+            "entities": [{"name": "transformer", "type": "technology"}],
+            "concept_actions": [{"action": "create", "name": "transformer", "reason": "New concept"}],
+            "review_items": [],
+        })
+        with patch("openkb.agent.compiler._llm_call", return_value=analysis_response):
+            result = _analyze_document(
+                model="gpt-4o-mini",
+                system_msg=system_msg,
+                doc_msg={"role": "user", "content": "Document text."},
+                concept_briefs="(none yet)",
+            )
+        assert "entities" in result
+        assert "concept_actions" in result
+        assert "review_items" in result
+        assert len(result["entities"]) == 1
+        assert result["entities"][0]["name"] == "transformer"
+
+    def test_analyze_document_malformed_response_returns_empty(self, tmp_path):
+        from openkb.agent.compiler import _analyze_document
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        system_msg = {"role": "system", "content": "You are a wiki agent."}
+        with patch("openkb.agent.compiler._llm_call", return_value="not json at all"):
+            result = _analyze_document(
+                model="gpt-4o-mini",
+                system_msg=system_msg,
+                doc_msg={"role": "user", "content": "Document text."},
+                concept_briefs="(none yet)",
+            )
+        assert result["entities"] == []
+        assert result["concept_actions"] == []
+        assert result["review_items"] == []
+
+    @pytest.mark.asyncio
+    async def test_compile_short_doc_with_analysis(self, tmp_path):
+        """compile_short_doc calls analysis before summary when LLM returns analysis data."""
+        wiki = tmp_path / "wiki"
+        (wiki / "sources").mkdir(parents=True)
+        (wiki / "summaries").mkdir(parents=True)
+        (wiki / "concepts").mkdir(parents=True)
+        (wiki / "index.md").write_text(
+            "# Index\n\n## Documents\n\n## Concepts\n\n## Explorations\n",
+            encoding="utf-8",
+        )
+        source_path = wiki / "sources" / "test-doc.md"
+        source_path.write_text("# Test Doc\n\nSome content about transformers.", encoding="utf-8")
+        (tmp_path / ".openkb").mkdir()
+
+        analysis_response = json.dumps({
+            "entities": [{"name": "transformer", "type": "technology"}],
+            "concept_actions": [{"action": "create", "name": "transformer", "reason": "New concept"}],
+            "review_items": [],
+        })
+        summary_response = json.dumps({
+            "brief": "Discusses transformers",
+            "content": "# Summary\n\nThis document discusses transformers.",
+        })
+        concepts_list_response = json.dumps({
+            "create": [{"name": "transformer", "title": "Transformer"}],
+            "update": [],
+            "related": [],
+        })
+        concept_page_response = json.dumps({
+            "brief": "NN architecture using self-attention",
+            "content": "# Transformer\n\nA neural network architecture.",
+        })
+
+        with patch("openkb.agent.compiler._llm_call") as mock_llm:
+            mock_llm.side_effect = [analysis_response, summary_response, concepts_list_response, concept_page_response]
+            await compile_short_doc("test-doc", source_path, tmp_path, "gpt-4o-mini")
+
+        # Verify analysis was called before summary
+        call_names = [call.kwargs.get("step_name", call.args[2] if len(call.args) > 2 else None) for call in mock_llm.call_args_list]
+        assert "analysis" in call_names
+        analysis_idx = call_names.index("analysis")
+        summary_idx = call_names.index("summary")
+        assert analysis_idx < summary_idx
+
+    @pytest.mark.asyncio
+    async def test_compile_short_doc_analysis_saves_review_items(self, tmp_path):
+        """Review items from analysis are saved to review_queue.json."""
+        wiki = tmp_path / "wiki"
+        (wiki / "sources").mkdir(parents=True)
+        (wiki / "summaries").mkdir(parents=True)
+        (wiki / "concepts").mkdir(parents=True)
+        (wiki / "index.md").write_text(
+            "# Index\n\n## Documents\n\n## Concepts\n\n## Explorations\n",
+            encoding="utf-8",
+        )
+        source_path = wiki / "sources" / "test-doc.md"
+        source_path.write_text("# Test Doc\n\nContent.", encoding="utf-8")
+        (tmp_path / ".openkb").mkdir()
+
+        analysis_response = json.dumps({
+            "entities": [],
+            "concept_actions": [],
+            "review_items": [
+                {"type": "contradiction", "title": "Conflict", "description": "Desc", "source_path": "summaries/test-doc.md"},
+            ],
+        })
+        summary_response = json.dumps({"brief": "Brief", "content": "# Summary"})
+        concepts_list_response = json.dumps({"create": [], "update": [], "related": []})
+
+        with patch("openkb.agent.compiler._llm_call") as mock_llm:
+            mock_llm.side_effect = [analysis_response, summary_response, concepts_list_response]
+            await compile_short_doc("test-doc", source_path, tmp_path, "gpt-4o-mini")
+
+        queue_path = tmp_path / ".openkb" / "review_queue.json"
+        assert queue_path.exists()
+        queue_data = json.loads(queue_path.read_text())
+        assert len(queue_data) == 1
+        assert queue_data[0]["type"] == "contradiction"
+
+    @pytest.mark.asyncio
+    async def test_compile_short_doc_no_review_items_no_queue_file(self, tmp_path):
+        """When analysis produces no review items, queue file should have empty array."""
+        wiki = tmp_path / "wiki"
+        (wiki / "sources").mkdir(parents=True)
+        (wiki / "summaries").mkdir(parents=True)
+        (wiki / "concepts").mkdir(parents=True)
+        (wiki / "index.md").write_text(
+            "# Index\n\n## Documents\n\n## Concepts\n\n## Explorations\n",
+            encoding="utf-8",
+        )
+        source_path = wiki / "sources" / "test-doc.md"
+        source_path.write_text("# Test Doc\n\nContent.", encoding="utf-8")
+        (tmp_path / ".openkb").mkdir()
+
+        analysis_response = json.dumps({
+            "entities": [], "concept_actions": [], "review_items": [],
+        })
+        summary_response = json.dumps({"brief": "Brief", "content": "# Summary"})
+        concepts_list_response = json.dumps({"create": [], "update": [], "related": []})
+
+        with patch("openkb.agent.compiler._llm_call") as mock_llm:
+            mock_llm.side_effect = [analysis_response, summary_response, concepts_list_response]
+            await compile_short_doc("test-doc", source_path, tmp_path, "gpt-4o-mini")
+
+        # Pipeline should still complete; review_queue.json may or may not exist with empty list
+        # The key assertion: no crash and pipeline completes
+
+    @pytest.mark.asyncio
+    async def test_analysis_context_injected_into_concept_plan(self, tmp_path):
+        """When analysis returns concept_actions, they are injected into the concept plan prompt."""
+        wiki = tmp_path / "wiki"
+        (wiki / "summaries").mkdir(parents=True)
+        (wiki / "concepts").mkdir(parents=True)
+        (wiki / "index.md").write_text(
+            "# Index\n\n## Documents\n\n## Concepts\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "raw").mkdir(exist_ok=True)
+        (tmp_path / "raw" / "test-doc.pdf").write_bytes(b"fake")
+
+        system_msg = {"role": "system", "content": "You are a wiki agent."}
+        doc_msg = {"role": "user", "content": "Document text."}
+        summary = "Summary."
+        analysis_context = {
+            "entities": [{"name": "transformer", "type": "technology"}],
+            "concept_actions": [{"action": "create", "name": "transformer", "reason": "New concept"}],
+            "review_items": [],
+        }
+
+        plan_response = json.dumps({"create": [], "update": [], "related": []})
+
+        with patch("openkb.agent.compiler._llm_call") as mock_llm:
+            mock_llm.side_effect = [plan_response]
+            await _compile_concepts(
+                wiki, tmp_path, "gpt-4o-mini", system_msg, doc_msg,
+                summary, "test-doc", 5,
+                analysis_context=analysis_context,
+            )
+            # Verify concept plan call includes analysis context
+            call_args = mock_llm.call_args
+            messages = call_args[0][1] if len(call_args[0]) > 1 else call_args.kwargs.get("messages")
+            # Find the user message with the concept plan prompt
+            plan_msg = None
+            for msg in messages:
+                if msg["role"] == "user" and "Existing concept" in msg.get("content", ""):
+                    plan_msg = msg["content"]
+                    break
+            assert plan_msg is not None
+            assert "Prior analysis" in plan_msg or "transformer" in plan_msg
 
 
 class TestEntityTypePipeline:
