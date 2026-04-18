@@ -14,12 +14,9 @@ import json
 import logging
 import re
 import sys
-import threading
 import time
 import unicodedata
 from pathlib import Path
-
-import litellm
 
 from openkb.schema import get_agents_md
 
@@ -131,41 +128,6 @@ Return ONLY the Markdown content (no frontmatter, no code fences).
 # LLM helpers
 # ---------------------------------------------------------------------------
 
-class _Spinner:
-    """Animated dots spinner that runs in a background thread."""
-
-    def __init__(self, label: str):
-        self._label = label
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-
-    def start(self) -> None:
-        sys.stdout.write(f"    {self._label}")
-        sys.stdout.flush()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def _run(self) -> None:
-        while not self._stop.wait(timeout=1.0):
-            sys.stdout.write(".")
-            sys.stdout.flush()
-
-    def stop(self, suffix: str = "") -> None:
-        self._stop.set()
-        if self._thread:
-            self._thread.join()
-        sys.stdout.write(f" {suffix}\n")
-        sys.stdout.flush()
-
-
-def _format_usage(elapsed: float, usage) -> str:
-    """Format timing and token usage into a short summary string."""
-    cached = getattr(usage, "prompt_tokens_details", None)
-    cache_info = ""
-    if cached and hasattr(cached, "cached_tokens") and cached.cached_tokens:
-        cache_info = f", cached={cached.cached_tokens}"
-    return f"{elapsed:.1f}s (in={usage.prompt_tokens}, out={usage.completion_tokens}{cache_info})"
-
 
 def _fmt_messages(messages: list[dict], max_content: int = 200) -> str:
     """Format messages for debug output, truncating long content."""
@@ -182,37 +144,45 @@ def _fmt_messages(messages: list[dict], max_content: int = 200) -> str:
 
 
 def _llm_call(model: str, messages: list[dict], step_name: str, **kwargs) -> str:
-    """Single LLM call with animated progress and debug logging."""
+    """Single LLM call via subprocess executor."""
+    from openkb.executor import ExecutorConfig, run_llm_with_system
     logger.debug("LLM request [%s]:\n%s", step_name, _fmt_messages(messages))
-    if kwargs:
-        logger.debug("LLM kwargs [%s]: %s", step_name, kwargs)
 
-    spinner = _Spinner(step_name)
-    spinner.start()
-    t0 = time.time()
+    # Build system and user prompts from messages list
+    system_parts = []
+    user_parts = []
+    for msg in messages:
+        if msg.get("role") == "system":
+            system_parts.append(msg["content"])
+        else:
+            user_parts.append(msg["content"])
 
-    response = litellm.completion(model=model, messages=messages, **kwargs)
-    content = response.choices[0].message.content or ""
+    system_prompt = "\n".join(system_parts)
+    user_prompt = "\n".join(user_parts)
 
-    spinner.stop(_format_usage(time.time() - t0, response.usage))
-    logger.debug("LLM response [%s]:\n%s", step_name, content[:500] + ("..." if len(content) > 500 else ""))
-    return content.strip()
+    # Determine provider from model prefix (e.g. "anthropic/claude-sonnet-4-6" → "claude")
+    cfg = kwargs.pop("executor_config", None) or ExecutorConfig()
+    # If model starts with "anthropic/" or is a short alias like "sonnet", use claude provider
+    if model and not model.startswith("anthropic/"):
+        cfg.model = model
+
+    result = run_llm_with_system(system_prompt, user_prompt, cfg)
+
+    if result.error:
+        logger.error("LLM error [%s]: %s", step_name, result.error)
+        raise RuntimeError(f"LLM call failed ({step_name}): {result.error}")
+
+    tokens_str = f"(in={result.input_tokens}, out={result.output_tokens})"
+    sys.stdout.write(f"    {step_name}... {result.elapsed_seconds:.1f}s {tokens_str}\n")
+    sys.stdout.flush()
+    logger.debug("LLM response [%s]:\n%s", step_name, result.text[:500] + ("..." if len(result.text) > 500 else ""))
+    return result.text.strip()
 
 
 async def _llm_call_async(model: str, messages: list[dict], step_name: str) -> str:
-    """Async LLM call with timing output and debug logging."""
-    logger.debug("LLM request [%s]:\n%s", step_name, _fmt_messages(messages))
-
-    t0 = time.time()
-
-    response = await litellm.acompletion(model=model, messages=messages)
-    content = response.choices[0].message.content or ""
-
-    elapsed = time.time() - t0
-    sys.stdout.write(f"    {step_name}... {_format_usage(elapsed, response.usage)}\n")
-    sys.stdout.flush()
-    logger.debug("LLM response [%s]:\n%s", step_name, content[:500] + ("..." if len(content) > 500 else ""))
-    return content.strip()
+    """Async LLM call — runs sync call in a thread pool."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _llm_call, model, messages, step_name)
 
 
 def _parse_json(text: str) -> list | dict:

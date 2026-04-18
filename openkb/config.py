@@ -6,7 +6,9 @@ from typing import Any
 import yaml
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "model": "gpt-5.4-mini",
+    "model": "sonnet",
+    "provider": "claude",
+    "effort": "medium",
     "language": "en",
     "pageindex_threshold": 20,
 }
