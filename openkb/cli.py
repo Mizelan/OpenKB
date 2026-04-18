@@ -29,6 +29,7 @@ from openkb.config import DEFAULT_CONFIG, load_config, save_config, load_global_
 from openkb.converter import convert_document
 from openkb.log import append_log
 from openkb.schema import AGENTS_MD
+from openkb.agent.compiler import _make_index_template
 
 # Suppress warnings after all imports — markitdown overrides filters at import time
 import warnings
@@ -287,17 +288,15 @@ def init():
 
     # Write wiki files
     Path("wiki/AGENTS.md").write_text(AGENTS_MD, encoding="utf-8")
-    Path("wiki/index.md").write_text(
-        "# Knowledge Base Index\n\n## Documents\n\n## Concepts\n\n## Explorations\n",
-        encoding="utf-8",
-    )
+    language = DEFAULT_CONFIG["language"]
+    Path("wiki/index.md").write_text(_make_index_template(language), encoding="utf-8")
     Path("wiki/log.md").write_text("# Operations Log\n\n", encoding="utf-8")
 
     # Create .openkb/ state directory
     openkb_dir.mkdir()
     config = {
         "model": model,
-        "language": DEFAULT_CONFIG["language"],
+        "language": language,
         "pageindex_threshold": DEFAULT_CONFIG["pageindex_threshold"],
     }
     save_config(openkb_dir / "config.yaml", config)

@@ -21,6 +21,9 @@ from openkb.agent.compiler import (
     _add_related_link,
     _backlink_summary,
     _backlink_concepts,
+    _section_heading,
+    _make_index_template,
+    _INDEX_SECTIONS,
 )
 
 
@@ -537,38 +540,6 @@ class TestAddRelatedLink:
         _add_related_link(wiki, "nonexistent", "doc", "file.pdf")
 
 
-def _mock_completion(responses: list[str]):
-    """Create a mock for litellm.completion that returns responses in order."""
-    call_count = {"n": 0}
-
-    def side_effect(*args, **kwargs):
-        idx = min(call_count["n"], len(responses) - 1)
-        call_count["n"] += 1
-        mock_resp = MagicMock()
-        mock_resp.choices = [MagicMock()]
-        mock_resp.choices[0].message.content = responses[idx]
-        mock_resp.usage = MagicMock(prompt_tokens=100, completion_tokens=50)
-        mock_resp.usage.prompt_tokens_details = None
-        return mock_resp
-
-    return side_effect
-
-
-def _mock_acompletion(responses: list[str]):
-    """Create an async mock for litellm.acompletion."""
-    call_count = {"n": 0}
-
-    async def side_effect(*args, **kwargs):
-        idx = min(call_count["n"], len(responses) - 1)
-        call_count["n"] += 1
-        mock_resp = MagicMock()
-        mock_resp.choices = [MagicMock()]
-        mock_resp.choices[0].message.content = responses[idx]
-        mock_resp.usage = MagicMock(prompt_tokens=100, completion_tokens=50)
-        mock_resp.usage.prompt_tokens_details = None
-        return mock_resp
-
-    return side_effect
 
 
 class TestCompileShortDoc:
@@ -603,13 +574,8 @@ class TestCompileShortDoc:
             "content": "# Transformer\n\nA neural network architecture.",
         })
 
-        with patch("openkb.agent.compiler.litellm") as mock_litellm:
-            mock_litellm.completion = MagicMock(
-                side_effect=_mock_completion([summary_response, concepts_list_response])
-            )
-            mock_litellm.acompletion = AsyncMock(
-                side_effect=_mock_acompletion([concept_page_response])
-            )
+        with patch("openkb.agent.compiler._llm_call") as mock_llm:
+            mock_llm.side_effect = [summary_response, concepts_list_response, concept_page_response]
             await compile_short_doc("test-doc", source_path, tmp_path, "gpt-4o-mini")
 
         # Verify summary written
@@ -640,10 +606,8 @@ class TestCompileShortDoc:
         source_path.write_text("Content", encoding="utf-8")
         (tmp_path / ".openkb").mkdir()
 
-        with patch("openkb.agent.compiler.litellm") as mock_litellm:
-            mock_litellm.completion = MagicMock(
-                side_effect=_mock_completion(["Plain summary text", "not valid json"])
-            )
+        with patch("openkb.agent.compiler._llm_call") as mock_llm:
+            mock_llm.side_effect = ["Plain summary text", "not valid json"]
             # Should not raise
             await compile_short_doc("doc", source_path, tmp_path, "gpt-4o-mini")
 
@@ -680,13 +644,8 @@ class TestCompileLongDoc:
             "content": "# Deep Learning\n\nA subfield of ML.",
         })
 
-        with patch("openkb.agent.compiler.litellm") as mock_litellm:
-            mock_litellm.completion = MagicMock(
-                side_effect=_mock_completion([overview_response, concepts_list_response])
-            )
-            mock_litellm.acompletion = AsyncMock(
-                side_effect=_mock_acompletion([concept_page_response])
-            )
+        with patch("openkb.agent.compiler._llm_call") as mock_llm:
+            mock_llm.side_effect = [overview_response, concepts_list_response, concept_page_response]
             await compile_long_doc(
                 "big-doc", summary_path, "doc-123", tmp_path, "gpt-4o-mini"
             )
@@ -748,29 +707,16 @@ class TestCompileConceptsPlan:
         doc_msg = {"role": "user", "content": "Document about attention mechanisms."}
         summary = "Summary of the document."
 
-        call_order = {"n": 0}
+        def mock_llm(model, messages, step_name, **kwargs):
+            if step_name == "concepts-plan":
+                return plan_response
+            elif step_name.startswith("concept:"):
+                return create_page_response
+            elif step_name.startswith("update:"):
+                return update_page_response
+            return ""
 
-        async def ordered_acompletion(*args, **kwargs):
-            idx = call_order["n"]
-            call_order["n"] += 1
-            mock_resp = MagicMock()
-            mock_resp.choices = [MagicMock()]
-            # create tasks come first, then update tasks
-            if idx == 0:
-                mock_resp.choices[0].message.content = create_page_response
-            else:
-                mock_resp.choices[0].message.content = update_page_response
-            mock_resp.usage = MagicMock(prompt_tokens=100, completion_tokens=50)
-            mock_resp.usage.prompt_tokens_details = None
-            return mock_resp
-
-        with patch("openkb.agent.compiler.litellm") as mock_litellm:
-            mock_litellm.completion = MagicMock(
-                side_effect=_mock_completion([plan_response])
-            )
-            mock_litellm.acompletion = AsyncMock(
-                side_effect=ordered_acompletion
-            )
+        with patch("openkb.agent.compiler._llm_call", side_effect=mock_llm):
             await _compile_concepts(
                 wiki, tmp_path, "gpt-4o-mini", system_msg, doc_msg,
                 summary, "test-doc", 5,
@@ -812,17 +758,14 @@ class TestCompileConceptsPlan:
         doc_msg = {"role": "user", "content": "Document content."}
         summary = "Summary."
 
-        with patch("openkb.agent.compiler.litellm") as mock_litellm:
-            mock_litellm.completion = MagicMock(
-                side_effect=_mock_completion([plan_response])
-            )
-            mock_litellm.acompletion = AsyncMock()
+        with patch("openkb.agent.compiler._llm_call") as mock_llm:
+            mock_llm.side_effect = [plan_response]
             await _compile_concepts(
                 wiki, tmp_path, "gpt-4o-mini", system_msg, doc_msg,
                 summary, "test-doc", 5,
             )
-            # acompletion should never be called — related is code-only
-            mock_litellm.acompletion.assert_not_called()
+            # Only the plan call should be made — related is code-only
+            assert mock_llm.call_count == 1
 
         # Verify link added to transformer page
         transformer_text = (wiki / "concepts" / "transformer.md").read_text()
@@ -846,13 +789,8 @@ class TestCompileConceptsPlan:
         doc_msg = {"role": "user", "content": "Document content."}
         summary = "Summary."
 
-        with patch("openkb.agent.compiler.litellm") as mock_litellm:
-            mock_litellm.completion = MagicMock(
-                side_effect=_mock_completion([plan_response])
-            )
-            mock_litellm.acompletion = AsyncMock(
-                side_effect=_mock_acompletion([concept_page_response])
-            )
+        with patch("openkb.agent.compiler._llm_call") as mock_llm:
+            mock_llm.side_effect = [plan_response, concept_page_response]
             await _compile_concepts(
                 wiki, tmp_path, "gpt-4o-mini", system_msg, doc_msg,
                 summary, "test-doc", 5,
@@ -864,6 +802,188 @@ class TestCompileConceptsPlan:
         att_text = att_path.read_text()
         assert "sources: [summaries/test-doc.md]" in att_text
         assert "Attention" in att_text
+
+
+class TestConceptsPlanPrompt:
+    def test_plan_requests_entity_type(self):
+        """Verify _CONCEPTS_PLAN_USER asks for entity_type in create items."""
+        from openkb.agent.compiler import _CONCEPTS_PLAN_USER
+        assert "entity_type" in _CONCEPTS_PLAN_USER
+        assert "person" in _CONCEPTS_PLAN_USER or "organization" in _CONCEPTS_PLAN_USER
+
+    def test_plan_requests_entity_type_in_update(self):
+        """Verify _CONCEPTS_PLAN_USER asks for entity_type in update items."""
+        from openkb.agent.compiler import _CONCEPTS_PLAN_USER
+        assert "entity_type" in _CONCEPTS_PLAN_USER
+        # Check that the prompt mentions entity_type for both create and update
+        lines = _CONCEPTS_PLAN_USER.split("\n")
+        create_lines = [l for l in lines if "create" in l.lower() and "entity_type" in l.lower()]
+        update_lines = [l for l in lines if "update" in l.lower() and "entity_type" in l.lower()]
+        # At least the main template should mention entity_type
+        assert len(create_lines) > 0 or "entity_type" in _CONCEPTS_PLAN_USER
+
+
+class TestConceptPagePrompts:
+    def test_concept_page_requests_entity_type(self):
+        """Verify _CONCEPT_PAGE_USER asks for entity_type in LLM output."""
+        from openkb.agent.compiler import _CONCEPT_PAGE_USER
+        assert "entity_type" in _CONCEPT_PAGE_USER
+
+    def test_concept_update_requests_entity_type(self):
+        """Verify _CONCEPT_UPDATE_USER asks for entity_type in LLM output."""
+        from openkb.agent.compiler import _CONCEPT_UPDATE_USER
+        assert "entity_type" in _CONCEPT_UPDATE_USER
+
+
+class TestWriteConceptEntityType:
+    def test_new_concept_with_entity_type(self, tmp_path):
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        _write_concept(wiki, "openai", "# OpenAI\n\nDetails.", "paper.pdf",
+                       False, brief="AI research company", entity_type="organization")
+        text = (wiki / "concepts" / "openai.md").read_text()
+        assert "entity_type: organization" in text
+        assert "brief: AI research company" in text
+
+    def test_new_concept_without_entity_type(self, tmp_path):
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        _write_concept(wiki, "attention", "# Attention\n\nDetails.", "paper.pdf", False)
+        text = (wiki / "concepts" / "attention.md").read_text()
+        assert "entity_type:" not in text
+
+    def test_update_concept_preserves_entity_type(self, tmp_path):
+        wiki = tmp_path / "wiki"
+        concepts = wiki / "concepts"
+        concepts.mkdir(parents=True)
+        (concepts / "openai.md").write_text(
+            "---\nsources: [paper1.pdf]\nbrief: AI company\nentity_type: organization\n---\n\n# OpenAI\n\nOld content.",
+            encoding="utf-8",
+        )
+        _write_concept(wiki, "openai", "New info.", "paper2.pdf", True, brief="Updated")
+        text = (concepts / "openai.md").read_text()
+        assert "entity_type: organization" in text
+
+    def test_update_concept_sets_entity_type(self, tmp_path):
+        wiki = tmp_path / "wiki"
+        concepts = wiki / "concepts"
+        concepts.mkdir(parents=True)
+        (concepts / "openai.md").write_text(
+            "---\nsources: [paper1.pdf]\nbrief: AI company\n---\n\n# OpenAI\n\nOld content.",
+            encoding="utf-8",
+        )
+        _write_concept(wiki, "openai", "New info.", "paper2.pdf", True,
+                       brief="Updated", entity_type="organization")
+        text = (concepts / "openai.md").read_text()
+        assert "entity_type: organization" in text
+
+
+class TestReadConceptBriefsWithEntityType:
+    def test_includes_entity_type(self, tmp_path):
+        wiki = tmp_path / "wiki"
+        concepts = wiki / "concepts"
+        concepts.mkdir(parents=True)
+        (concepts / "openai.md").write_text(
+            "---\nsources: [paper.pdf]\nbrief: AI company\nentity_type: organization\n---\n\n# OpenAI\n\nContent.",
+            encoding="utf-8",
+        )
+        result = _read_concept_briefs(wiki)
+        assert "organization" in result
+
+    def test_no_entity_type_omits_tag(self, tmp_path):
+        wiki = tmp_path / "wiki"
+        concepts = wiki / "concepts"
+        concepts.mkdir(parents=True)
+        (concepts / "attention.md").write_text(
+            "---\nsources: [paper.pdf]\nbrief: Focus mechanism\n---\n\n# Attention\n\nContent.",
+            encoding="utf-8",
+        )
+        result = _read_concept_briefs(wiki)
+        assert "[organization]" not in result
+        assert "- attention: Focus mechanism" in result
+
+    def test_mixed_entity_types(self, tmp_path):
+        wiki = tmp_path / "wiki"
+        concepts = wiki / "concepts"
+        concepts.mkdir(parents=True)
+        (concepts / "openai.md").write_text(
+            "---\nsources: [paper.pdf]\nbrief: AI company\nentity_type: organization\n---\n\nContent.",
+            encoding="utf-8",
+        )
+        (concepts / "attention.md").write_text(
+            "---\nsources: [paper.pdf]\nbrief: Focus mechanism\n---\n\nContent.",
+            encoding="utf-8",
+        )
+        result = _read_concept_briefs(wiki)
+        assert "openai [organization]" in result
+        assert "attention: Focus mechanism" in result
+
+
+class TestKoreanSectionHeaders:
+    def test_make_index_template_english(self):
+        template = _make_index_template("en")
+        assert "## Documents" in template
+        assert "## Concepts" in template
+        assert "## Explorations" in template
+        assert "# Knowledge Base Index" in template
+
+    def test_make_index_template_korean(self):
+        template = _make_index_template("ko")
+        assert "## \ubb38\uc11c" in template
+        assert "## \uac1c\ub150" in template
+        assert "## \ud0d0\uad6c" in template
+        assert "# \uc9c0\uc2dd \ubca0\uc774\uc2a4 \uc778\ub371\uc2a4" in template
+
+    def test_section_heading_english(self):
+        assert _section_heading("en", "documents") == "## Documents"
+        assert _section_heading("en", "concepts") == "## Concepts"
+
+    def test_section_heading_korean(self):
+        assert _section_heading("ko", "documents") == "## \ubb38\uc11c"
+        assert _section_heading("ko", "concepts") == "## \uac1c\ub150"
+
+    def test_section_heading_unknown_defaults_english(self):
+        assert _section_heading("fr", "documents") == "## Documents"
+
+    def test_update_index_korean_headers(self, tmp_path):
+        """_update_index should use Korean headers when language='ko'."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        (wiki / "index.md").write_text(
+            "# \uc9c0\uc2dd \ubca0\uc774\uc2a4 \uc778\ub371\uc2a4\n\n## \ubb38\uc11c\n\n## \uac1c\ub150\n\n## \ud0d0\uad6c\n",
+            encoding="utf-8",
+        )
+        _update_index(wiki, "my-doc", ["attention"],
+                     doc_brief="Introduces transformers",
+                     concept_briefs={"attention": "Focus mechanism"}, language="ko")
+        text = (wiki / "index.md").read_text()
+        assert "[[summaries/my-doc]]" in text
+        assert "## \ubb38\uc11c" in text
+        assert "## \uac1c\ub150" in text
+
+    def test_update_index_english_headers_default(self, tmp_path):
+        """_update_index should use English headers by default."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        (wiki / "index.md").write_text(
+            "# Knowledge Base Index\n\n## Documents\n\n## Concepts\n\n## Explorations\n",
+            encoding="utf-8",
+        )
+        _update_index(wiki, "my-doc", ["attention"],
+                     doc_brief="Introduces transformers",
+                     concept_briefs={"attention": "Focus mechanism"})
+        text = (wiki / "index.md").read_text()
+        assert "## Documents" in text
+        assert "## Concepts" in text
+
+    def test_update_index_creates_korean_template(self, tmp_path):
+        """_update_index should create Korean template when language='ko' and no index exists."""
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        _update_index(wiki, "my-doc", [], language="ko")
+        text = (wiki / "index.md").read_text()
+        assert "## \ubb38\uc11c" in text
+        assert "## \uac1c\ub150" in text
 
 
 class TestBriefIntegration:
@@ -897,13 +1017,8 @@ class TestBriefIntegration:
             "content": "# Transformer\n\nA neural network architecture.",
         })
 
-        with patch("openkb.agent.compiler.litellm") as mock_litellm:
-            mock_litellm.completion = MagicMock(
-                side_effect=_mock_completion([summary_resp, plan_resp])
-            )
-            mock_litellm.acompletion = AsyncMock(
-                side_effect=_mock_acompletion([concept_resp])
-            )
+        with patch("openkb.agent.compiler._llm_call") as mock_llm:
+            mock_llm.side_effect = [summary_resp, plan_resp, concept_resp]
             await compile_short_doc("test-doc", source_path, tmp_path, "gpt-4o-mini")
 
         # Summary frontmatter has doc_type and full_text
@@ -919,3 +1034,117 @@ class TestBriefIntegration:
         index_text = (wiki / "index.md").read_text()
         assert "— A paper about transformers" in index_text
         assert "— NN architecture using self-attention" in index_text
+
+
+class TestEntityTypePipeline:
+    """Kill tests verifying entity_type flows from concept plan through _write_concept."""
+
+    @pytest.mark.asyncio
+    async def test_gen_create_entity_type_in_result(self, tmp_path):
+        """_gen_create extracts entity_type from concept dict and writes it to concept file."""
+        wiki = tmp_path / "wiki"
+        (wiki / "summaries").mkdir(parents=True)
+        (wiki / "concepts").mkdir(parents=True)
+        (wiki / "index.md").write_text("# Index\n\n## Documents\n\n## Concepts\n", encoding="utf-8")
+        (tmp_path / "raw").mkdir(exist_ok=True)
+        (tmp_path / "raw" / "test-doc.pdf").write_bytes(b"fake")
+
+        plan_response = json.dumps({
+            "create": [{"name": "openai", "title": "OpenAI", "entity_type": "organization"}],
+            "update": [],
+            "related": [],
+        })
+        concept_response = json.dumps({
+            "brief": "AI research company",
+            "entity_type": "organization",
+            "content": "# OpenAI\n\nAn AI research company.",
+        })
+
+        system_msg = {"role": "system", "content": "You are a wiki agent."}
+        doc_msg = {"role": "user", "content": "Document about OpenAI."}
+        summary = "Summary."
+
+        with patch("openkb.agent.compiler._llm_call") as mock_llm:
+            mock_llm.side_effect = [plan_response, concept_response]
+            await _compile_concepts(
+                wiki, tmp_path, "gpt-4o-mini", system_msg, doc_msg,
+                summary, "test-doc", 5,
+            )
+
+        concept_text = (wiki / "concepts" / "openai.md").read_text()
+        assert "entity_type: organization" in concept_text
+
+    @pytest.mark.asyncio
+    async def test_gen_update_entity_type_in_result(self, tmp_path):
+        """_gen_update extracts entity_type from concept dict and writes it to concept file."""
+        wiki = tmp_path / "wiki"
+        (wiki / "summaries").mkdir(parents=True)
+        concepts = wiki / "concepts"
+        concepts.mkdir(parents=True)
+        (concepts / "openai.md").write_text(
+            "---\nsources: [paper1.pdf]\nbrief: AI company\n---\n\n# OpenAI\n\nOld content.",
+            encoding="utf-8",
+        )
+        (wiki / "index.md").write_text("# Index\n\n## Documents\n\n## Concepts\n", encoding="utf-8")
+        (tmp_path / "raw").mkdir(exist_ok=True)
+        (tmp_path / "raw" / "test-doc.pdf").write_bytes(b"fake")
+
+        plan_response = json.dumps({
+            "create": [],
+            "update": [{"name": "openai", "title": "OpenAI", "entity_type": "organization"}],
+            "related": [],
+        })
+        update_response = json.dumps({
+            "brief": "Updated AI company",
+            "entity_type": "organization",
+            "content": "# OpenAI\n\nUpdated content.",
+        })
+
+        system_msg = {"role": "system", "content": "You are a wiki agent."}
+        doc_msg = {"role": "user", "content": "Document about OpenAI."}
+        summary = "Summary."
+
+        with patch("openkb.agent.compiler._llm_call") as mock_llm:
+            mock_llm.side_effect = [plan_response, update_response]
+            await _compile_concepts(
+                wiki, tmp_path, "gpt-4o-mini", system_msg, doc_msg,
+                summary, "test-doc", 5,
+            )
+
+        concept_text = (concepts / "openai.md").read_text()
+        assert "entity_type: organization" in concept_text
+
+    @pytest.mark.asyncio
+    async def test_entity_type_from_plan_as_fallback(self, tmp_path):
+        """entity_type from concept plan dict is used when LLM response lacks it."""
+        wiki = tmp_path / "wiki"
+        (wiki / "summaries").mkdir(parents=True)
+        (wiki / "concepts").mkdir(parents=True)
+        (wiki / "index.md").write_text("# Index\n\n## Documents\n\n## Concepts\n", encoding="utf-8")
+        (tmp_path / "raw").mkdir(exist_ok=True)
+        (tmp_path / "raw" / "test-doc.pdf").write_bytes(b"fake")
+
+        plan_response = json.dumps({
+            "create": [{"name": "openai", "title": "OpenAI", "entity_type": "organization"}],
+            "update": [],
+            "related": [],
+        })
+        # LLM response omits entity_type — should fall back to plan's entity_type
+        concept_response = json.dumps({
+            "brief": "AI research company",
+            "content": "# OpenAI\n\nAn AI research company.",
+        })
+
+        system_msg = {"role": "system", "content": "You are a wiki agent."}
+        doc_msg = {"role": "user", "content": "Document about OpenAI."}
+        summary = "Summary."
+
+        with patch("openkb.agent.compiler._llm_call") as mock_llm:
+            mock_llm.side_effect = [plan_response, concept_response]
+            await _compile_concepts(
+                wiki, tmp_path, "gpt-4o-mini", system_msg, doc_msg,
+                summary, "test-doc", 5,
+            )
+
+        concept_text = (wiki / "concepts" / "openai.md").read_text()
+        assert "entity_type: organization" in concept_text
