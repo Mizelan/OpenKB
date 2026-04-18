@@ -38,6 +38,24 @@ warnings.filterwarnings("ignore")
 
 load_dotenv()  # load from cwd (covers running inside the KB dir)
 
+logger = logging.getLogger(__name__)
+
+
+def _compile_with_retry(fn, *, attempts: int = 2, delay: float = 2.0) -> None:
+    """Run an async compile fn with one retry on failure."""
+    for attempt in range(attempts):
+        try:
+            fn()
+            return
+        except Exception as exc:
+            if attempt == 0:
+                click.echo(f"  Retrying compilation in {delay:.0f}s...")
+                time.sleep(delay)
+            else:
+                click.echo(f"  [ERROR] Compilation failed: {exc}")
+                logger.debug("Compilation traceback:", exc_info=True)
+                raise
+
 
 def _setup_llm_key(kb_dir: Path | None = None) -> None:
     """Set LiteLLM API key from LLM_API_KEY env var if present.
@@ -142,7 +160,6 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
     from openkb.agent.compiler import compile_long_doc, compile_short_doc
     from openkb.state import HashRegistry
 
-    logger = logging.getLogger(__name__)
     openkb_dir = kb_dir / ".openkb"
     config = load_config(openkb_dir / "config.yaml")
     _setup_llm_key(kb_dir)
@@ -177,35 +194,17 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
 
         summary_path = kb_dir / "wiki" / "summaries" / f"{doc_name}.md"
         click.echo(f"  Compiling long doc (doc_id={index_result.doc_id})...")
-        for attempt in range(2):
-            try:
-                asyncio.run(
-                    compile_long_doc(doc_name, summary_path, index_result.doc_id, kb_dir, model,
-                                     doc_description=index_result.description)
-                )
-                break
-            except Exception as exc:
-                if attempt == 0:
-                    click.echo(f"  Retrying compilation in 2s...")
-                    time.sleep(2)
-                else:
-                    click.echo(f"  [ERROR] Compilation failed: {exc}")
-                    logger.debug("Compilation traceback:", exc_info=True)
-                    return
+        _compile_with_retry(
+            lambda: asyncio.run(
+                compile_long_doc(doc_name, summary_path, index_result.doc_id, kb_dir, model,
+                                 doc_description=index_result.description)
+            )
+        )
     else:
         click.echo(f"  Compiling short doc...")
-        for attempt in range(2):
-            try:
-                asyncio.run(compile_short_doc(doc_name, result.source_path, kb_dir, model))
-                break
-            except Exception as exc:
-                if attempt == 0:
-                    click.echo(f"  Retrying compilation in 2s...")
-                    time.sleep(2)
-                else:
-                    click.echo(f"  [ERROR] Compilation failed: {exc}")
-                    logger.debug("Compilation traceback:", exc_info=True)
-                    return
+        _compile_with_retry(
+            lambda: asyncio.run(compile_short_doc(doc_name, result.source_path, kb_dir, model))
+        )
 
     # Register hash only after successful compilation
     if result.file_hash:

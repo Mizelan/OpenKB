@@ -1,46 +1,18 @@
 """Parse ---REVIEW--- blocks from LLM output."""
 from __future__ import annotations
 
-import json
 import logging
 
+from openkb.json_utils import extract_json
 from openkb.review.models import ReviewItem
 
 logger = logging.getLogger(__name__)
 
 
 def _extract_json_array(text: str) -> list:
-    """Extract the first JSON array from text, handling trailing content."""
-    start = text.find("[")
-    if start == -1:
-        return []
-    # Find the matching closing bracket
-    depth = 0
-    in_string = False
-    escape = False
-    for i in range(start, len(text)):
-        c = text[i]
-        if escape:
-            escape = False
-            continue
-        if c == "\\":
-            escape = True
-            continue
-        if c == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if c == "[":
-            depth += 1
-        elif c == "]":
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(text[start:i + 1])
-                except json.JSONDecodeError:
-                    return []
-    return []
+    """Extract the first JSON array from text."""
+    result = extract_json(text, start_char="[")
+    return result if isinstance(result, list) else []
 
 
 def parse_review_blocks(text: str) -> list[ReviewItem]:

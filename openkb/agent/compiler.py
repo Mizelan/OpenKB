@@ -18,6 +18,7 @@ import time
 import unicodedata
 from pathlib import Path
 
+from openkb.json_utils import extract_json
 from openkb.schema import get_agents_md
 from openkb.review import ReviewItem, parse_review_blocks, ReviewQueue
 
@@ -276,61 +277,23 @@ def _clean_concept_content(content: str) -> str:
 def _parse_json(text: str) -> list | dict:
     """Parse JSON from LLM response, handling fences, prose, and malformed JSON.
 
-    Strips conversational wrapper text (greetings, commentary, insight blocks)
-    that Claude CLI may emit before/after the actual JSON payload.
+    Uses extract_json for bracket matching, then attempts json_repair
+    on failure as a fallback for malformed LLM output.
     """
     from json_repair import repair_json
-    cleaned = text.strip()
+    result = extract_json(text)
+    if result is not None:
+        if not isinstance(result, (dict, list)):
+            raise ValueError(f"Expected JSON object or array, got {type(result).__name__}")
+        return result
 
-    # Strip markdown code fences
+    # Fallback: json_repair on the raw text for malformed JSON
+    cleaned = text.strip()
     if cleaned.startswith("```"):
         first_nl = cleaned.find("\n")
         cleaned = cleaned[first_nl + 1:] if first_nl != -1 else cleaned[3:]
         if cleaned.endswith("```"):
             cleaned = cleaned[:-3]
-
-    cleaned = cleaned.strip()
-
-    # If the text doesn't start with { or [, find the first JSON structure.
-    # This strips conversational wrapper text the LLM may emit.
-    if cleaned and not cleaned.startswith(("{", "[")):
-        brace_idx = cleaned.find("{")
-        bracket_idx = cleaned.find("[")
-        # Pick whichever comes first
-        indices = [i for i in (brace_idx, bracket_idx) if i != -1]
-        if indices:
-            cleaned = cleaned[min(indices):]
-
-    # Truncate trailing text after the closing bracket
-    if cleaned:
-        # Find the matching closing bracket for the opening one
-        open_ch = cleaned[0]
-        close_ch = "}" if open_ch == "{" else "]"
-        depth = 0
-        in_string = False
-        escape = False
-        end = len(cleaned)
-        for i, c in enumerate(cleaned):
-            if escape:
-                escape = False
-                continue
-            if c == "\\":
-                escape = True
-                continue
-            if c == '"':
-                in_string = not in_string
-                continue
-            if in_string:
-                continue
-            if c == open_ch:
-                depth += 1
-            elif c == close_ch:
-                depth -= 1
-                if depth == 0:
-                    end = i + 1
-                    break
-        cleaned = cleaned[:end]
-
     result = json.loads(repair_json(cleaned.strip()))
     if not isinstance(result, (dict, list)):
         raise ValueError(f"Expected JSON object or array, got {type(result).__name__}")
@@ -468,6 +431,32 @@ def _write_summary(wiki_dir: Path, doc_name: str, summary: str,
 _SAFE_NAME_RE = re.compile(r'[^\w\-]')
 
 
+def _split_frontmatter(text: str) -> tuple[str, str]:
+    """Split text into (frontmatter_block, body). Returns ('', text) if no FM."""
+    if text.startswith("---"):
+        end = text.find("---", 3)
+        if end != -1:
+            return text[:end + 3], text[end + 3:]
+    return "", text
+
+
+def _inject_fm_field(frontmatter: str, field: str, value: str) -> str:
+    """Insert or replace a YAML field in a frontmatter block."""
+    pattern = f"{field}:"
+    if pattern in frontmatter:
+        return re.sub(rf"{re.escape(field)}:.*", f"{field}: {value}", frontmatter)
+    return frontmatter.replace("---\n", f"---\n{field}: {value}\n", 1)
+
+
+def _strip_frontmatter(text: str) -> str:
+    """Remove leading frontmatter block from text."""
+    if text.startswith("---"):
+        end = text.find("---", 3)
+        if end != -1:
+            return text[end + 3:].lstrip("\n")
+    return text
+
+
 def _sanitize_concept_name(name: str) -> str:
     """Sanitize a concept name for safe use as a filename."""
     name = unicodedata.normalize("NFKC", name)
@@ -541,66 +530,38 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
     if is_update and path.exists():
         existing = path.read_text(encoding="utf-8")
         if source_file not in existing:
-            if existing.startswith("---"):
-                end = existing.find("---", 3)
-                if end != -1:
-                    fm = existing[:end + 3]
-                    body = existing[end + 3:]
-                    if "sources:" in fm:
-                        fm = fm.replace("sources: [", f"sources: [{source_file}, ")
-                    else:
-                        fm = fm.replace("---\n", f"---\nsources: [{source_file}]\n", 1)
-                    existing = fm + body
+            fm, body = _split_frontmatter(existing)
+            if fm:
+                if "sources:" in fm:
+                    fm = fm.replace("sources: [", f"sources: [{source_file}, ")
+                else:
+                    fm = _inject_fm_field(fm, "sources", f"[{source_file}]")
+                existing = fm + body
             else:
                 existing = f"---\nsources: [{source_file}]\n---\n\n" + existing
-        # Strip frontmatter from LLM content to avoid duplicate blocks
-        clean = content
-        if clean.startswith("---"):
-            end = clean.find("---", 3)
-            if end != -1:
-                clean = clean[end + 3:].lstrip("\n")
-        # Replace body with LLM rewrite (prompt asks for full rewrite, not delta)
-        if existing.startswith("---"):
-            end = existing.find("---", 3)
-            if end != -1:
-                existing = existing[:end + 3] + "\n\n" + clean
-            else:
-                existing = clean
-        else:
-            existing = clean
-        if brief and existing.startswith("---"):
-            end = existing.find("---", 3)
-            if end != -1:
-                fm = existing[:end + 3]
-                body = existing[end + 3:]
-                if "brief:" in fm:
-                    fm = re.sub(r"brief:.*", f"brief: {brief}", fm)
-                else:
-                    fm = fm.replace("---\n", f"---\nbrief: {brief}\n", 1)
+        clean = _strip_frontmatter(content)
+        fm, body = _split_frontmatter(existing)
+        existing = (fm + "\n\n" + clean) if fm else clean
+        if brief and fm:
+            fm, body = _split_frontmatter(existing)
+            if fm:
+                fm = _inject_fm_field(fm, "brief", brief)
                 existing = fm + body
-        if entity_type and existing.startswith("---"):
-            end = existing.find("---", 3)
-            if end != -1:
-                fm = existing[:end + 3]
-                body = existing[end + 3:]
-                if "entity_type:" in fm:
-                    fm = re.sub(r"entity_type:.*", f"entity_type: {entity_type}", fm)
-                else:
-                    fm = fm.replace("---\n", f"---\nentity_type: {entity_type}\n", 1)
+        if entity_type and fm:
+            fm, body = _split_frontmatter(existing)
+            if fm:
+                fm = _inject_fm_field(fm, "entity_type", entity_type)
                 existing = fm + body
         path.write_text(existing, encoding="utf-8")
     else:
-        if content.startswith("---"):
-            end = content.find("---", 3)
-            if end != -1:
-                content = content[end + 3:].lstrip("\n")
+        clean = _strip_frontmatter(content)
         fm_lines = [f"sources: [{source_file}]"]
         if brief:
             fm_lines.append(f"brief: {brief}")
         if entity_type:
             fm_lines.append(f"entity_type: {entity_type}")
         frontmatter = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
-        path.write_text(frontmatter + content, encoding="utf-8")
+        path.write_text(frontmatter + clean, encoding="utf-8")
 
 
 def _add_related_link(wiki_dir: Path, concept_slug: str, doc_name: str, source_file: str) -> None:
