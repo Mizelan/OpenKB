@@ -39,9 +39,9 @@ dependencies = [
     "rich>=13.0",
 ]
 
-[project.optional-dependencies.litellm]
-litellm = ["litellm"]
-openai-agents = ["openai-agents"]
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+litellm = ["litellm", "openai-agents"]
 
 [project.urls]
 Repository = "https://github.com/VectifyAI/OpenKB"
@@ -53,10 +53,6 @@ openkb = "openkb.cli:cli"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-
-[project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio"]
-litellm = ["litellm", "openai-agents"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["openkb"]
