@@ -1362,3 +1362,43 @@ class TestEntityTypePipeline:
 
         concept_text = (wiki / "concepts" / "openai.md").read_text()
         assert "entity_type: organization" in concept_text
+
+
+class TestCompileConceptsGraphRebuild:
+    """Verify that _compile_concepts calls build_and_save_graph after _update_index."""
+
+    @pytest.mark.asyncio
+    async def test_build_and_save_graph_called(self, tmp_path):
+        """_compile_concepts should invoke build_and_save_graph as Step 5."""
+        wiki = tmp_path / "wiki"
+        (wiki / "summaries").mkdir(parents=True)
+        (wiki / "concepts").mkdir(parents=True)
+        (wiki / "index.md").write_text(
+            "# Index\n\n## Documents\n\n## Concepts\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "raw").mkdir(exist_ok=True)
+        (tmp_path / "raw" / "test-doc.pdf").write_bytes(b"fake")
+
+        plan_response = json.dumps({
+            "create": [{"name": "alpha", "title": "Alpha"}],
+            "update": [],
+            "related": [],
+        })
+        concept_response = json.dumps({
+            "brief": "Alpha concept",
+            "content": "# Alpha\n\nContent.",
+        })
+
+        system_msg = {"role": "system", "content": "You are a wiki agent."}
+        doc_msg = {"role": "user", "content": "Document content."}
+        summary = "Summary."
+
+        with patch("openkb.agent.compiler._llm_call") as mock_llm, \
+             patch("openkb.graph.build.build_and_save_graph") as mock_graph:
+            mock_llm.side_effect = [plan_response, concept_response]
+            await _compile_concepts(
+                wiki, tmp_path, "gpt-4o-mini", system_msg, doc_msg,
+                summary, "test-doc", 5,
+            )
+            mock_graph.assert_called_once_with(wiki, tmp_path / ".openkb")

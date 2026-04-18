@@ -899,6 +899,13 @@ async def _compile_concepts(
                   doc_brief=doc_brief, concept_briefs=concept_briefs_map,
                   doc_type=doc_type, language=language)
 
+    # --- Step 5: Auto graph rebuild (non-blocking) ---
+    try:
+        from openkb.graph.build import build_and_save_graph
+        build_and_save_graph(wiki_dir, kb_dir / ".openkb")
+    except Exception as exc:
+        logger.warning("Graph rebuild failed (non-fatal): %s", exc)
+
 
 async def compile_short_doc(
     doc_name: str,
