@@ -40,6 +40,7 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
 
     meta: dict = {}
     sources: list[str] = []
+    in_sources_list = False
     for line in fm_block.split("\n"):
         line = line.strip()
         if line.startswith("entity_type:"):
@@ -47,15 +48,18 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
         elif line.startswith("brief:"):
             meta["brief"] = line[len("brief:"):].strip().strip("\"'")
         elif line.startswith("sources:"):
+            in_sources_list = True
             src_part = line[len("sources:"):].strip()
             if src_part.startswith("[") and src_part.endswith("]"):
                 inner = src_part[1:-1]
                 sources = [s.strip().strip("\"'") for s in inner.split(",") if s.strip()]
-        elif line.startswith("- ") and sources is not None:
-            # YAML list item for sources
+                in_sources_list = False
+        elif in_sources_list and line.startswith("- "):
             val = line[2:].strip().strip("\"'")
             if val:
                 sources.append(val)
+        else:
+            in_sources_list = False
 
     meta["sources"] = sources
     return meta, body
@@ -179,7 +183,11 @@ def save_graph(graph: nx.Graph, path: Path) -> None:
 
 def load_graph(path: Path) -> nx.Graph:
     """Deserialise graph from JSON file."""
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Failed to load graph from %s: %s", path, exc)
+        return nx.Graph()
     g = nx.Graph()
 
     for nid, attr in data.get("nodes", {}).items():

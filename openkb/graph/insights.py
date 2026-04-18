@@ -46,6 +46,15 @@ def find_sparse_communities(
     return result
 
 
+def _build_node_to_comm(communities: dict[int, list[str]]) -> dict[str, int]:
+    """Build reverse mapping: node -> community_id."""
+    node_to_comm: dict[str, int] = {}
+    for comm_id, members in communities.items():
+        for m in members:
+            node_to_comm[m] = comm_id
+    return node_to_comm
+
+
 def find_bridge_nodes(
     graph: nx.Graph,
     communities: dict[int, list[str]],
@@ -55,11 +64,7 @@ def find_bridge_nodes(
 
     Returns [(node_name, community_span_count), ...].
     """
-    # Build reverse mapping: node -> community_id
-    node_to_comm: dict[str, int] = {}
-    for comm_id, members in communities.items():
-        for m in members:
-            node_to_comm[m] = comm_id
+    node_to_comm = _build_node_to_comm(communities)
 
     bridges = []
     for node in graph.nodes:
@@ -87,10 +92,7 @@ def find_surprising_connections(
     Returns [(source, target, reason, score), ...].
     Reason is 'cross-community' or 'type-variant' (different entity_type).
     """
-    node_to_comm: dict[str, int] = {}
-    for comm_id, members in communities.items():
-        for m in members:
-            node_to_comm[m] = comm_id
+    node_to_comm = _build_node_to_comm(communities)
 
     surprising = []
     for u, v in graph.edges:

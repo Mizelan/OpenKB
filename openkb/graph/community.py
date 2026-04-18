@@ -27,11 +27,8 @@ def compute_cohesion(graph: nx.Graph, members: list[str]) -> float:
     if n <= 1:
         return 0.0
 
-    member_set = set(members)
-    internal_edges = 0
-    for u, v in graph.edges:
-        if u in member_set and v in member_set:
-            internal_edges += 1
+    sub = graph.subgraph(members)
+    internal_edges = sub.number_of_edges()
 
     max_edges = n * (n - 1) / 2
     return internal_edges / max_edges if max_edges > 0 else 0.0

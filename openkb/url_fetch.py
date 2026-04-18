@@ -215,11 +215,20 @@ def fetch_article(url: str) -> tuple[str, str]:
     """
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "OpenKB/0.1 (knowledge-base-fetcher)"},
+        headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0 Safari/537.36"},
     )
 
+    # Use certifi CA bundle to avoid macOS Python SSL issues
+    import ssl
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        import certifi
+        context = ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        context = None
+
+    try:
+        kw = {"context": context} if context else {}
+        with urllib.request.urlopen(req, timeout=30, **kw) as resp:
             html_bytes = resp.read()
     except urllib.error.URLError as exc:
         raise FetchError(url, f"Network error: {exc}")
