@@ -322,12 +322,31 @@ def init():
 @click.argument("path")
 @click.pass_context
 def add(ctx, path):
-    """Add a document or directory of documents at PATH to the knowledge base."""
+    """Add a document, URL, or directory at PATH to the knowledge base."""
     kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
     if kb_dir is None:
         click.echo("No knowledge base found. Run `openkb init` first.")
         return
 
+    # --- URL path ---
+    from openkb.url_fetch import is_url, fetch_url, FetchError
+
+    if is_url(path):
+        click.echo(f"Fetching URL: {path}")
+        try:
+            markdown, slug = fetch_url(path)
+        except FetchError as exc:
+            click.echo(f"  [ERROR] {exc}")
+            return
+        raw_dir = kb_dir / "raw"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        raw_path = raw_dir / f"{slug}.md"
+        raw_path.write_text(markdown, encoding="utf-8")
+        click.echo(f"  Saved to {raw_path.relative_to(kb_dir)}")
+        add_single_file(raw_path, kb_dir)
+        return
+
+    # --- Local file path ---
     target = Path(path)
     if not target.exists():
         click.echo(f"Path does not exist: {path}")
@@ -354,6 +373,83 @@ def add(ctx, path):
             )
             return
         add_single_file(target, kb_dir)
+
+
+def _parse_frontmatter(path: Path) -> dict | None:
+    """Parse YAML frontmatter from a markdown file. Returns dict or None."""
+    import yaml
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not text.startswith("---"):
+        return None
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return None
+    try:
+        return yaml.safe_load(parts[1]) or {}
+    except yaml.YAMLError:
+        return None
+
+
+@cli.command("add-sources")
+@click.argument("source_dir", type=click.Path(exists=True, file_okay=False))
+@click.option("--type", "source_type_filter", default=None,
+              help="Only add URLs with this source_type (e.g. twitter, youtube, article).")
+@click.option("--limit", "max_count", type=int, default=None,
+              help="Maximum number of URLs to process.")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Show what would be added without fetching.")
+@click.pass_context
+def add_sources(ctx, source_dir, source_type_filter, max_count, dry_run):
+    """Scan PKM-source directory for URLs in frontmatter and add them to the KB."""
+    kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
+    if kb_dir is None:
+        click.echo("No knowledge base found. Run `openkb init` first.")
+        return
+
+    from openkb.url_fetch import is_url, fetch_url, FetchError
+
+    source_path = Path(source_dir)
+    md_files = sorted(source_path.rglob("*.md"))
+
+    urls_to_add: list[tuple[str, str, Path]] = []  # (url, source_type, source_file)
+    for md_file in md_files:
+        fm = _parse_frontmatter(md_file)
+        if not fm:
+            continue
+        url = str(fm.get("url", "")).strip('"').strip("'")
+        stype = str(fm.get("source_type", ""))
+        if not url or not is_url(url):
+            continue
+        if source_type_filter and stype != source_type_filter:
+            continue
+        urls_to_add.append((url, stype, md_file))
+
+    if max_count:
+        urls_to_add = urls_to_add[:max_count]
+
+    click.echo(f"Found {len(urls_to_add)} URLs to add.")
+    if dry_run:
+        for i, (url, stype, src_file) in enumerate(urls_to_add, 1):
+            click.echo(f"  [{i}] [{stype}] {url}")
+        return
+
+    raw_dir = kb_dir / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    for i, (url, stype, src_file) in enumerate(urls_to_add, 1):
+        click.echo(f"\n[{i}/{len(urls_to_add)}] [{stype}] {url}")
+        try:
+            markdown, slug = fetch_url(url)
+        except FetchError as exc:
+            click.echo(f"  [ERROR] {exc}")
+            continue
+        raw_path = raw_dir / f"{slug}.md"
+        raw_path.write_text(markdown, encoding="utf-8")
+        click.echo(f"  Saved to {raw_path.relative_to(kb_dir)}")
+        add_single_file(raw_path, kb_dir)
 
 
 @cli.command()
@@ -767,3 +863,69 @@ def status(ctx):
         click.echo("No knowledge base found. Run `openkb init` first.")
         return
     print_status(kb_dir)
+
+
+@cli.command(name="insights")
+@click.pass_context
+def insights(ctx):
+    """Show graph insights: communities, knowledge gaps, and surprising connections."""
+    kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
+    if kb_dir is None:
+        click.echo("No knowledge base found. Run `openkb init` first.")
+        return
+
+    from openkb.graph.build import build_graph, load_graph, build_and_save_graph
+    from openkb.graph.insights import generate_insights
+
+    wiki_dir = kb_dir / "wiki"
+    graph_path = kb_dir / ".openkb" / "graph.json"
+
+    # Load or build graph
+    if graph_path.exists():
+        graph = load_graph(graph_path)
+    else:
+        openkb_dir = kb_dir / ".openkb"
+        build_and_save_graph(wiki_dir, openkb_dir)
+        graph = load_graph(graph_path)
+
+    if graph.number_of_nodes() == 0:
+        click.echo("No graph data. Add documents first with `openkb add`.")
+        return
+
+    result = generate_insights(graph)
+
+    # Header
+    n_comm = len(result["communities_summary"])
+    click.echo(f"Graph: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges, {n_comm} communities\n")
+
+    # Surprising connections
+    click.echo("== Surprising Connections ==")
+    for src, tgt, reason, score in result["surprising_connections"][:10]:
+        click.echo(f"  {src} <-> {tgt}  [{reason}]  score={score:.2f}")
+    if not result["surprising_connections"]:
+        click.echo("  (none)")
+
+    # Knowledge gaps
+    click.echo("\n== Knowledge Gaps ==")
+    orphans = result["orphans"]
+    if orphans:
+        click.echo(f"  Orphan nodes ({len(orphans)}):")
+        for name, deg in orphans[:10]:
+            click.echo(f"    {name}  (degree={deg})")
+    sparse = result["sparse_communities"]
+    if sparse:
+        click.echo(f"  Sparse communities ({len(sparse)}):")
+        for cid, rep, coh in sparse[:10]:
+            click.echo(f"    community {cid} (rep: {rep})  cohesion={coh:.3f}")
+    bridges = result["bridge_nodes"]
+    if bridges:
+        click.echo(f"  Bridge nodes ({len(bridges)}):")
+        for name, span in bridges[:10]:
+            click.echo(f"    {name}  (spans {span} communities)")
+    if not orphans and not sparse and not bridges:
+        click.echo("  (none)")
+
+    # Communities
+    click.echo("\n== Communities ==")
+    for cid, info in sorted(result["communities_summary"].items()):
+        click.echo(f"  [{cid}] {info['representative']}  size={info['size']}  cohesion={info['cohesion']}")
