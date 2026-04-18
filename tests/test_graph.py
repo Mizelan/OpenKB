@@ -474,3 +474,69 @@ class TestInsightsCLI:
         result = runner.invoke(cli, ["--kb-dir", str(tmp_path), "insights"])
         # Should not crash — may have 0 communities for small graph but no error
         assert result.exit_code == 0 or "No knowledge base" in result.output
+
+
+# ---------------------------------------------------------------------------
+# search_related_pages (tools.py) tests
+# ---------------------------------------------------------------------------
+
+class TestSearchRelatedPages:
+    def test_returns_formatted_related_pages(self, tmp_path):
+        from openkb.graph.build import build_and_save_graph
+        from openkb.agent.tools import search_related_pages
+
+        wiki = _make_wiki(tmp_path)
+        openkb_dir = tmp_path / ".openkb"
+        openkb_dir.mkdir()
+        build_and_save_graph(wiki, openkb_dir)
+
+        result = search_related_pages("concepts/alpha", 5, str(tmp_path))
+        # Should contain the related page slug and relevance score
+        assert "concepts/beta" in result
+        assert "relevance:" in result
+
+    def test_top_k_limits_result_count(self, tmp_path):
+        from openkb.graph.build import build_and_save_graph
+        from openkb.agent.tools import search_related_pages
+
+        wiki = _make_two_cluster_wiki(tmp_path)
+        openkb_dir = tmp_path / ".openkb"
+        openkb_dir.mkdir()
+        build_and_save_graph(wiki, openkb_dir)
+
+        result = search_related_pages("concepts/bridge", 2, str(tmp_path))
+        lines = [line for line in result.strip().split("\n") if line.strip()]
+        assert len(lines) == 2
+
+    def test_returns_message_when_graph_missing(self, tmp_path):
+        from openkb.agent.tools import search_related_pages
+
+        openkb_dir = tmp_path / ".openkb"
+        openkb_dir.mkdir()
+        # No graph.json created
+        result = search_related_pages("concepts/alpha", 5, str(tmp_path))
+        assert "Graph not available" in result
+
+    def test_returns_message_when_page_not_in_graph(self, tmp_path):
+        from openkb.graph.build import build_and_save_graph
+        from openkb.agent.tools import search_related_pages
+
+        wiki = _make_wiki(tmp_path)
+        openkb_dir = tmp_path / ".openkb"
+        openkb_dir.mkdir()
+        build_and_save_graph(wiki, openkb_dir)
+
+        result = search_related_pages("nonexistent/page", 5, str(tmp_path))
+        assert "not found in graph" in result
+
+    def test_returns_no_related_for_isolated_node(self, tmp_path):
+        from openkb.graph.build import build_and_save_graph
+        from openkb.agent.tools import search_related_pages
+
+        wiki = _make_two_cluster_wiki(tmp_path)
+        openkb_dir = tmp_path / ".openkb"
+        openkb_dir.mkdir()
+        build_and_save_graph(wiki, openkb_dir)
+
+        result = search_related_pages("concepts/lonely", 5, str(tmp_path))
+        assert "No related pages found" in result

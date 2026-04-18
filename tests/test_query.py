@@ -15,9 +15,9 @@ class TestBuildQueryAgent:
         agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
         assert agent.name == "wiki-query"
 
-    def test_agent_has_three_tools(self, tmp_path):
+    def test_agent_has_four_tools(self, tmp_path):
         agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
-        assert len(agent.tools) == 3
+        assert len(agent.tools) == 4
 
     def test_agent_tool_names(self, tmp_path):
         agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
@@ -25,11 +25,27 @@ class TestBuildQueryAgent:
         assert "read_file" in names
         assert "get_page_content" in names
         assert "get_image" in names
+        assert "search_related" in names
 
     def test_instructions_mention_get_page_content(self, tmp_path):
         agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
         assert "get_page_content" in agent.instructions
         assert "pageindex_retrieve" not in agent.instructions
+
+    def test_instructions_mention_search_related(self, tmp_path):
+        agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
+        assert "search_related" in agent.instructions
+
+
+class TestSearchRelatedTool:
+    def test_agent_has_four_tools(self, tmp_path):
+        agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
+        assert len(agent.tools) == 4
+
+    def test_agent_tool_names_include_search_related(self, tmp_path):
+        agent = build_query_agent(str(tmp_path), "gpt-4o-mini")
+        names = {t.name for t in agent.tools}
+        assert "search_related" in names
 
     def test_schema_in_instructions(self, tmp_path):
         agent = build_query_agent(str(tmp_path), "gpt-4o-mini")

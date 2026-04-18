@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import json as _json
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import networkx as nx
 
 
 def list_wiki_files(directory: str, wiki_root: str) -> str:
@@ -188,4 +192,35 @@ def write_wiki_file(path: str, content: str, wiki_root: str) -> str:
     full_path.parent.mkdir(parents=True, exist_ok=True)
     full_path.write_text(content, encoding="utf-8")
     return f"Written: {path}"
+
+
+def search_related_pages(page_name: str, top_k: int, kb_dir: str) -> str:
+    """Return top-k related pages for *page_name* using the knowledge graph.
+
+    Args:
+        page_name: Wiki page slug (e.g. ``"concepts/attention"``).
+        top_k: Maximum number of related pages to return.
+        kb_dir: Absolute path to the knowledge-base directory (parent of wiki/).
+
+    Returns:
+        Newline-separated list of ``page_slug (relevance: X.XX)`` lines,
+        or an error message if the graph or page is unavailable.
+    """
+    from openkb.graph.build import load_graph
+    from openkb.graph.relevance import top_related
+
+    graph_path = Path(kb_dir) / ".openkb" / "graph.json"
+    if not graph_path.exists():
+        return "Graph not available. Run 'openkb add' first."
+
+    graph: nx.Graph = load_graph(graph_path)
+
+    if page_name not in graph.nodes:
+        return f"Page '{page_name}' not found in graph."
+
+    results = top_related(graph, page_name, k=top_k)
+    if not results:
+        return f"No related pages found for '{page_name}'."
+
+    return "\n".join(f"{slug} (relevance: {score:.2f})" for slug, score in results)
 

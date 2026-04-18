@@ -6,7 +6,7 @@ from pathlib import Path
 from agents import Agent, Runner, function_tool
 
 from agents import ToolOutputImage, ToolOutputText
-from openkb.agent.tools import get_wiki_page_content, read_wiki_file, read_wiki_image
+from openkb.agent.tools import get_wiki_page_content, read_wiki_file, read_wiki_image, search_related_pages
 
 MAX_TURNS = 50
 from openkb.schema import get_agents_md
@@ -29,6 +29,9 @@ You are OpenKB, a knowledge-base Q&A agent. You answer questions by searching th
    - PageIndex documents (doc_type: pageindex): use get_page_content(doc_name, pages)
      with tight page ranges. The summary shows document tree structure with page
      ranges to help you target. Never fetch the whole document.
+4.5 After finding relevant concepts, use search_related to discover indirectly
+    related pages via the knowledge graph. This expands your coverage beyond
+    direct wikilinks and can surface pages that share sources or neighbours.
 5. Source content may reference images (e.g. ![image](sources/images/doc/file.png)).
    Use the get_image tool to view them when needed.
 6. Synthesize a clear, concise, well-cited answer grounded in wiki content.
@@ -80,12 +83,27 @@ def build_query_agent(wiki_root: str, model: str, language: str = "en") -> Agent
             return ToolOutputImage(image_url=result["image_url"])
         return ToolOutputText(text=result["text"])
 
+    kb_dir = str(Path(wiki_root).parent)
+
+    @function_tool
+    def search_related(page_name: str, top_k: int = 5) -> str:
+        """Find related wiki pages using the knowledge graph.
+
+        Use after identifying relevant concepts to discover indirectly related
+        pages that share sources or graph neighbours.
+
+        Args:
+            page_name: Wiki page slug (e.g. 'concepts/attention').
+            top_k: Maximum number of related pages to return (default 5).
+        """
+        return search_related_pages(page_name, top_k, kb_dir)
+
     from agents.model_settings import ModelSettings
 
     return Agent(
         name="wiki-query",
         instructions=instructions,
-        tools=[read_file, get_page_content, get_image],
+        tools=[read_file, get_page_content, get_image, search_related],
         model=f"litellm/{model}",
         model_settings=ModelSettings(parallel_tool_calls=False),
     )
