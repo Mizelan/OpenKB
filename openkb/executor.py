@@ -339,6 +339,12 @@ def _parse_codex_app_stream(stdout: str, model: str) -> LLMResult:
     return _collect_codex_app_stream(stdout.splitlines(), model)
 
 
+def _with_provider(result: LLMResult, provider: str) -> LLMResult:
+    """Return *result* with a provider label suited to the caller."""
+    result.provider = provider
+    return result
+
+
 def _find_binary(name: str) -> str:
     """Find a binary on PATH, or return the name as-is."""
     import shutil
@@ -495,23 +501,39 @@ class ClaudeExecutor(BaseExecutor):
 
 
 class CodexExecutor(BaseExecutor):
-    """Codex simple CLI — plain text output."""
+    """Codex executor using `codex exec --json` with provider-local labeling."""
     provider_name = "codex"
     binary_name = "codex"
 
     def build_args(self, prompt: str) -> list[str]:
         return [
-            "--model", self.cfg.effective_model,
-            "--effort", self.cfg.effort,
-            "-p", prompt,
+            "exec",
+            "--json",
+            "--ephemeral",
+            "-c", f'model_reasoning_effort="{self.cfg.effort}"',
+            "-m", self.cfg.effective_model,
+            prompt,
         ]
 
     def parse_output(self, stdout: str) -> LLMResult:
-        return LLMResult(
-            text=stdout.strip(),
-            provider="codex",
-            model=self.cfg.effective_model,
+        return _with_provider(_parse_codex_app_stream(stdout, self.cfg.effective_model), self.provider_name)
+
+    def parse_stream(self, lines: Iterable[str], on_text_delta: TextDeltaCallback | None = None) -> LLMResult:
+        return _with_provider(
+            _collect_codex_app_stream(lines, self.cfg.effective_model, on_text_delta),
+            self.provider_name,
         )
+
+    def run_streaming(
+        self,
+        prompt: str,
+        on_text_delta: TextDeltaCallback | None = None,
+    ) -> LLMResult:
+        """Buffered fallback for Codex CLI to avoid stdout/stderr deadlocks."""
+        result = self.run(prompt)
+        if result.text and on_text_delta is not None:
+            on_text_delta(result.text)
+        return result
 
 
 class CodexAppExecutor(BaseExecutor):

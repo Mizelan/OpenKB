@@ -110,6 +110,30 @@ class TestRunQuery:
         assert answer == "Hello world"
         assert capsys.readouterr().out == "Hello world\n"
 
+    @pytest.mark.asyncio
+    async def test_run_query_keeps_stream_callback_for_codex_provider(self, tmp_path):
+        (tmp_path / "wiki").mkdir()
+        openkb_dir = tmp_path / ".openkb"
+        openkb_dir.mkdir()
+        (openkb_dir / "config.yaml").write_text(
+            "provider: codex\nmodel: gpt-5.4-mini\neffort: low\n",
+            encoding="utf-8",
+        )
+
+        captured = {}
+
+        async def fake_run(agent, message, **kwargs):
+            captured["on_tool_call"] = kwargs.get("on_tool_call")
+            captured["on_text_delta"] = kwargs.get("on_text_delta")
+            return ExecutorRunResult(final_output="Done.", history=[], turns=1)
+
+        with patch("openkb.agent.query.run_executor_agent", side_effect=fake_run):
+            answer = await run_query("Use codex.", tmp_path, "gpt-5.4-mini", stream=True, raw=True)
+
+        assert answer == "Done."
+        assert captured["on_tool_call"] is not None
+        assert captured["on_text_delta"] is not None
+
 
 class TestExplorationPromotion:
     def _make_kb(self, tmp_path: Path) -> Path:

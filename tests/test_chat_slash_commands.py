@@ -248,6 +248,35 @@ async def test_run_turn_streams_response_and_persists_history(tmp_path, capsys):
 
 
 @pytest.mark.asyncio
+async def test_run_turn_keeps_text_streaming_callback_for_codex_provider(tmp_path, capsys):
+    kb_dir = _setup_kb(tmp_path)
+    session = _make_session(kb_dir)
+
+    class _Agent:
+        provider = "codex"
+
+    captured = {}
+
+    async def fake_run(agent, message, **kwargs):
+        captured["on_text_delta"] = kwargs.get("on_text_delta")
+        return ExecutorRunResult(
+            final_output="Hello codex chat",
+            history=[
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "Hello codex chat"},
+            ],
+            turns=1,
+        )
+
+    with patch("openkb.agent.executor_runtime.run_executor_agent", side_effect=fake_run):
+        await _run_turn(_Agent(), session, "Hi", _STYLE, use_color=False, raw=True)
+
+    assert captured["on_text_delta"] is not None
+    assert capsys.readouterr().out == "\nHello codex chat\n\n"
+    assert session.assistant_texts == ["Hello codex chat"]
+
+
+@pytest.mark.asyncio
 async def test_slash_save_writes_transcript_page(tmp_path):
     kb_dir = _setup_kb(tmp_path)
     session = _make_session(kb_dir)

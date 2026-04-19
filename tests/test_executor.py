@@ -142,12 +142,25 @@ class TestCodexAppExecutorBuildArgs:
 
 
 class TestCodexExecutorBuildArgs:
-    def test_simple_codex_args(self):
+    def test_codex_uses_exec_json_without_effort_flag(self):
         cfg = ExecutorConfig(provider="codex", model="gpt-5.4-mini")
         ex = CodexExecutor(cfg)
         args = ex.build_args("prompt text")
-        assert "--model" in args
-        assert "-p" in args
+        assert args[0] == "exec"
+        assert "--json" in args
+        assert "--ephemeral" in args
+        assert "-m" in args
+        i_m = args.index("-m")
+        assert args[i_m + 1] == "gpt-5.4-mini"
+        assert "--effort" not in args
+        assert args[-1] == "prompt text"
+
+    def test_codex_maps_effort_to_model_reasoning_effort_config(self):
+        cfg = ExecutorConfig(provider="codex", model="gpt-5.4-mini", effort="low")
+        ex = CodexExecutor(cfg)
+        args = ex.build_args("prompt text")
+        i_c = args.index("-c")
+        assert args[i_c + 1] == 'model_reasoning_effort="low"'
 
 
 class TestOllamaExecutor:
@@ -371,6 +384,32 @@ class TestStreamingExecutors:
         assert "".join(streamed) == "Nested stream"
         assert result.text == "Nested stream"
 
+    def test_codex_streaming_uses_buffered_fallback_and_emits_final_text(self):
+        streamed: list[str] = []
+        events = [
+            {"type": "thread.started", "thread_id": "t1"},
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": '{"type":"final","content":"Hello Codex"}'}},
+            {"type": "turn.completed", "usage": {"input_tokens": 5, "output_tokens": 2}},
+        ]
+        mock_stdout = "\n".join(json.dumps(e) for e in events)
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = mock_stdout
+        mock_proc.stderr = ""
+
+        with patch("openkb.executor.subprocess.run", return_value=mock_proc):
+            result = run_llm_with_system_streaming(
+                "system",
+                "user",
+                ExecutorConfig(provider="codex", model="gpt-5.4-mini"),
+                streamed.append,
+            )
+
+        assert "".join(streamed) == '{"type":"final","content":"Hello Codex"}'
+        assert result.text == '{"type":"final","content":"Hello Codex"}'
+
 
 # ---------------------------------------------------------------------------
 # _llm_call integration: provider auto-detection
@@ -472,6 +511,33 @@ class TestCodexAppExecutorRun:
 
         assert result.error is not None
         assert "Exit code 1" in result.error
+
+
+class TestCodexExecutorRun:
+    def test_mock_subprocess_returns_parsed_result(self):
+        events = [
+            {"type": "thread.started", "thread_id": "t1"},
+            {"type": "turn.started"},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "Generated answer."}},
+            {"type": "turn.completed", "usage": {"input_tokens": 80, "output_tokens": 20}},
+        ]
+        mock_stdout = "\n".join(json.dumps(e) for e in events)
+
+        cfg = ExecutorConfig(provider="codex", model="gpt-5.4-mini")
+        ex = CodexExecutor(cfg)
+
+        mock_proc = MagicMock()
+        mock_proc.returncode = 0
+        mock_proc.stdout = mock_stdout
+
+        with patch("openkb.executor.subprocess.run", return_value=mock_proc):
+            result = ex.run("write an answer")
+
+        assert result.text == "Generated answer."
+        assert result.input_tokens == 80
+        assert result.output_tokens == 20
+        assert result.provider == "codex"
+        assert result.error is None
 
 
 # ---------------------------------------------------------------------------
