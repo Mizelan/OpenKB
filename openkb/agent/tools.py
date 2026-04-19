@@ -1,8 +1,7 @@
 """Plain wiki tool functions for the OpenKB agent.
 
-These functions are intentionally NOT decorated with ``@function_tool`` here.
-Decoration happens when building the agent so that the same functions can be
-tested in isolation without requiring the openai-agents runtime.
+These functions stay framework-neutral so they can be reused by the
+executor-only runtime and tested in isolation.
 """
 from __future__ import annotations
 
@@ -206,14 +205,17 @@ def search_related_pages(page_name: str, top_k: int, kb_dir: str) -> str:
         Newline-separated list of ``page_slug (relevance: X.XX)`` lines,
         or an error message if the graph or page is unavailable.
     """
-    from openkb.graph.build import load_graph
+    from openkb.graph.build import load_graph, GraphLoadError
     from openkb.graph.relevance import top_related
 
     graph_path = Path(kb_dir) / ".openkb" / "graph.json"
     if not graph_path.exists():
         return "Graph not available. Run 'openkb add' first."
 
-    graph: nx.Graph = load_graph(graph_path)
+    try:
+        graph: nx.Graph = load_graph(graph_path)
+    except GraphLoadError:
+        return "graph.json이 손상되었습니다. `openkb add`로 재생성하세요."
 
     if page_name not in graph.nodes:
         return f"Page '{page_name}' not found in graph."
@@ -223,4 +225,3 @@ def search_related_pages(page_name: str, top_k: int, kb_dir: str) -> str:
         return f"No related pages found for '{page_name}'."
 
     return "\n".join(f"{slug} (relevance: {score:.2f})" for slug, score in results)
-

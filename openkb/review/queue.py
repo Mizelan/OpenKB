@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Callable
 
 from openkb.review.models import ReviewItem
 
@@ -47,10 +48,26 @@ class ReviewQueue:
     def accept(self, index: int) -> ReviewItem:
         """Remove and return item at *index*, then save. Raises IndexError if out of range."""
         item = self._items.pop(index)
+        item.status = "accepted"
         self.save()
         return item
 
     def skip(self, index: int) -> None:
         """Remove item at *index* without returning it. Raises IndexError if out of range."""
-        self._items.pop(index)
+        item = self._items.pop(index)
+        item.status = "skipped"
         self.save()
+
+    def apply(self, index: int, action_runner: Callable[[ReviewItem], object]) -> ReviewItem:
+        """Apply a review item action and only consume the queue item after success."""
+        item = self._items[index]
+        item.status = "pending"
+        try:
+            action_runner(item)
+        except Exception:
+            self.save()
+            raise
+        applied = self._items.pop(index)
+        applied.status = "applied"
+        self.save()
+        return applied

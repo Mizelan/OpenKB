@@ -3,12 +3,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agents import Agent, Runner, function_tool
-
+from openkb.agent.executor_runtime import ExecutorAgent, ExecutorTool, run_executor_agent
 from openkb.agent.tools import list_wiki_files, read_wiki_file
+from openkb.schema import get_agents_md
 
 MAX_TURNS = 50
-from openkb.schema import SCHEMA_MD, get_agents_md
 
 _LINTER_INSTRUCTIONS_TEMPLATE = """\
 You are OpenKB's semantic lint agent. Your job is to audit the wiki
@@ -37,65 +36,66 @@ If no issues are found in a category, say "None found."
 """
 
 
-def build_lint_agent(wiki_root: str, model: str, language: str = "en") -> Agent:
-    """Build the semantic knowledge-lint agent.
-
-    Args:
-        wiki_root: Absolute path to the wiki directory.
-        model: LLM model name.
-        language: Language code for wiki content (e.g. 'en', 'fr').
-
-    Returns:
-        Configured :class:`~agents.Agent` instance.
-    """
+def build_lint_agent(
+    wiki_root: str,
+    model: str,
+    language: str = "en",
+    *,
+    provider: str = "",
+    effort: str = "medium",
+) -> ExecutorAgent:
+    """Build the semantic knowledge-lint agent."""
     schema_md = get_agents_md(Path(wiki_root))
     instructions = _LINTER_INSTRUCTIONS_TEMPLATE.format(schema_md=schema_md)
     instructions += f"\n\nIMPORTANT: Write the lint report in {language} language."
 
-    @function_tool
     def list_files(directory: str) -> str:
-        """List all Markdown files in a wiki subdirectory.
-
-        Args:
-            directory: Subdirectory path relative to wiki root (e.g. 'summaries').
-        """
         return list_wiki_files(directory, wiki_root)
 
-    @function_tool
     def read_file(path: str) -> str:
-        """Read a Markdown file from the wiki.
-
-        Args:
-            path: File path relative to wiki root (e.g. 'summaries/paper.md').
-        """
         return read_wiki_file(path, wiki_root)
 
-    return Agent(
+    return ExecutorAgent(
         name="wiki-linter",
         instructions=instructions,
-        tools=[list_files, read_file],
-        model=f"litellm/{model}",
+        tools=[
+            ExecutorTool(
+                name="list_files",
+                description="List Markdown files in a wiki subdirectory.",
+                handler=list_files,
+            ),
+            ExecutorTool(
+                name="read_file",
+                description="Read a Markdown file from the wiki by relative path.",
+                handler=read_file,
+            ),
+        ],
+        model=model,
+        provider=provider,
+        effort=effort,
+        working_dir=str(Path(wiki_root).parent),
+        max_turns=MAX_TURNS,
     )
 
 
 async def run_knowledge_lint(kb_dir: Path, model: str) -> str:
-    """Run the semantic knowledge lint agent against the wiki.
-
-    Args:
-        kb_dir: Root of the knowledge base.
-        model: LLM model name.
-
-    Returns:
-        The agent's lint report as a Markdown string.
-    """
+    """Run the semantic knowledge lint agent against the wiki."""
     from openkb.config import load_config
 
     openkb_dir = kb_dir / ".openkb"
     config = load_config(openkb_dir / "config.yaml")
     language: str = config.get("language", "en")
+    provider: str = config.get("provider", "")
+    effort: str = config.get("effort", "medium")
 
     wiki_root = str(kb_dir / "wiki")
-    agent = build_lint_agent(wiki_root, model, language=language)
+    agent = build_lint_agent(
+        wiki_root,
+        model,
+        language=language,
+        provider=provider,
+        effort=effort,
+    )
 
     prompt = (
         "Please audit this knowledge base wiki for semantic quality issues: "
@@ -104,5 +104,5 @@ async def run_knowledge_lint(kb_dir: Path, model: str) -> str:
         "Produce a structured Markdown report."
     )
 
-    result = await Runner.run(agent, prompt, max_turns=MAX_TURNS)
+    result = await run_executor_agent(agent, prompt)
     return result.final_output or "Knowledge lint completed. No output produced."

@@ -81,17 +81,18 @@ openkb query "What are the main findings?"
 openkb chat
 ```
 
-### Set up your LLM
+### Set up your executor
 
-OpenKB comes with [multi-LLM support](https://docs.litellm.ai/docs/providers) (e.g., OpenAI, Claude, Gemini) via [LiteLLM](https://github.com/BerriAI/litellm) (pinned to a [safe version](https://docs.litellm.ai/blog/security-update-march-2026)).
+OpenKB runs its LLM steps through local subprocess executors instead of an API-key runtime. Pick the provider you want during `openkb init`, or edit [`.openkb/config.yaml`](#configuration) directly.
 
-Set your model during `openkb init`, or in [`.openkb/config.yaml`](#configuration), using `provider/model` LiteLLM format (like `anthropic/claude-sonnet-4-6`). OpenAI models can omit the prefix (like `gpt-5.4`).
+Supported executor styles include:
 
-Create a `.env` file with your LLM API key:
+- `provider: claude` with models like `sonnet`, `opus`, or `claude-sonnet-4-6`
+- `provider: codex_app` with models like `gpt-5.4-mini` or `gpt-5.4`
+- `provider: codex` with the same OpenAI-family model names
+- `provider: ollama` with local model names like `llama3`, `mistral`, or `qwen2`
 
-```bash
-LLM_API_KEY=your_llm_api_key
-```
+Legacy prefixed model strings such as `anthropic/claude-sonnet-4-6` remain readable in config files, but OpenKB normalizes them before calling the executor.
 
 # 🧩 How OpenKB Works
 
@@ -186,18 +187,21 @@ Inside a chat, type `/` to access slash commands (Tab to complete):
 Settings are initialized by `openkb init`, and stored in `.openkb/config.yaml`:
 
 ```yaml
-model: gpt-5.4                   # LLM model (any LiteLLM-supported provider)
+provider: claude                # Local executor provider
+model: sonnet                   # Model name for that executor
+effort: medium                  # Executor reasoning effort
 language: en                     # Wiki output language
 pageindex_threshold: 20          # PDF pages threshold for PageIndex
 ```
 
-Model names use `provider/model` LiteLLM [format](https://docs.litellm.ai/docs/providers) (OpenAI models can omit the prefix):
+Typical provider/model combinations:
 
 | Provider | Model example |
 |---|---|
-| OpenAI | `gpt-5.4` |
-| Anthropic | `anthropic/claude-sonnet-4-6` |
-| Gemini | `gemini/gemini-3.1-pro-preview` |
+| Claude executor | `sonnet`, `opus`, `claude-sonnet-4-6` |
+| Codex App executor | `gpt-5.4-mini`, `gpt-5.4` |
+| Codex executor | `gpt-5.4-mini`, `gpt-5.4` |
+| Ollama executor | `llama3`, `mistral`, `qwen2` |
 
 ### PageIndex Integration
 
@@ -251,8 +255,7 @@ OpenKB's wiki is a directory of Markdown files with `[[wikilinks]]`. Obsidian re
 
 - [PageIndex](https://github.com/VectifyAI/PageIndex) — Vectorless, reasoning-based document indexing and retrieval
 - [markitdown](https://github.com/microsoft/markitdown) — Universal file-to-markdown conversion
-- [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) — Agent framework (supports non-OpenAI models via LiteLLM)
-- [LiteLLM](https://github.com/BerriAI/litellm) — Multi-provider LLM gateway
+- Local executor CLIs — `claude`, `codex`, or `ollama`-backed execution
 - [Click](https://click.palletsprojects.com/) — CLI framework
 - [watchdog](https://github.com/gorakhargosh/watchdog) — Filesystem monitoring
 

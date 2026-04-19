@@ -10,27 +10,22 @@ warnings.filterwarnings("ignore")
 import asyncio
 import json
 import logging
+import math
 import time
 from pathlib import Path
 
 import os
 
-from agents import set_tracing_disabled
-set_tracing_disabled(True)
-# Use local model cost map — skip fetching from GitHub on every invocation
-os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
-
 import click
-import litellm
-litellm.suppress_debug_info = True
 from dotenv import load_dotenv
 
 from openkb.config import DEFAULT_CONFIG, load_config, save_config, load_global_config, register_kb
 from openkb.converter import convert_document
+from openkb.graph.insights_bg import maybe_trigger_insights
 from openkb.log import append_log
 from openkb.schema import AGENTS_MD
 from openkb.agent.compiler import _make_index_template
-from openkb.review import ReviewQueue
+from openkb.review import ReviewQueue, apply_review_action
 
 # Suppress warnings after all imports — markitdown overrides filters at import time
 import warnings
@@ -39,6 +34,15 @@ warnings.filterwarnings("ignore")
 load_dotenv()  # load from cwd (covers running inside the KB dir)
 
 logger = logging.getLogger(__name__)
+
+
+def _run_async_entrypoint(coro):
+    """Run a coroutine from synchronous CLI code and close it on early failure."""
+    try:
+        return asyncio.run(coro)
+    except Exception:
+        coro.close()
+        raise
 
 
 def _compile_with_retry(fn, *, attempts: int = 2, delay: float = 2.0) -> None:
@@ -55,45 +59,6 @@ def _compile_with_retry(fn, *, attempts: int = 2, delay: float = 2.0) -> None:
                 click.echo(f"  [ERROR] Compilation failed: {exc}")
                 logger.debug("Compilation traceback:", exc_info=True)
                 raise
-
-
-def _setup_llm_key(kb_dir: Path | None = None) -> None:
-    """Set LiteLLM API key from LLM_API_KEY env var if present.
-
-    Load order (override=False, so first one wins):
-    1. System environment variables (already set)
-    2. KB-local .env  (kb_dir/.env)
-    3. Global .env    (~/.config/openkb/.env)
-
-    Also propagates to provider-specific env vars (OPENAI_API_KEY, etc.)
-    so that the Agents SDK litellm provider can pick them up.
-    """
-    if kb_dir is not None:
-        env_file = kb_dir / ".env"
-        if env_file.exists():
-            load_dotenv(env_file, override=False)
-
-    from openkb.config import GLOBAL_CONFIG_DIR
-    global_env = GLOBAL_CONFIG_DIR / ".env"
-    if global_env.exists():
-        load_dotenv(global_env, override=False)
-
-    api_key = os.environ.get("LLM_API_KEY", "")
-    if not api_key:
-        # Check if any provider key is already set
-        has_key = any(os.environ.get(k) for k in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"))
-        if not has_key:
-            click.echo(
-                "Warning: No LLM API key found. Set one of:\n"
-                f"  1. {kb_dir / '.env' if kb_dir else '<kb_dir>/.env'} — LLM_API_KEY=sk-...\n"
-                f"  2. {GLOBAL_CONFIG_DIR / '.env'} — LLM_API_KEY=sk-...\n"
-                "  3. Export LLM_API_KEY in your shell profile"
-            )
-    else:
-        litellm.api_key = api_key
-        for env_var in ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY"):
-            if not os.environ.get(env_var):
-                os.environ[env_var] = api_key
 
 # Supported document extensions for the `add` command
 SUPPORTED_EXTENSIONS = {
@@ -148,7 +113,7 @@ def _find_kb_dir(override: Path | None = None) -> Path | None:
     return None
 
 
-def add_single_file(file_path: Path, kb_dir: Path) -> None:
+def add_single_file(file_path: Path, kb_dir: Path) -> bool:
     """Convert, index, and compile a single document into the knowledge base.
 
     Steps:
@@ -162,7 +127,6 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
 
     openkb_dir = kb_dir / ".openkb"
     config = load_config(openkb_dir / "config.yaml")
-    _setup_llm_key(kb_dir)
     model: str = config.get("model", DEFAULT_CONFIG["model"])
     registry = HashRegistry(openkb_dir / "hashes.json")
 
@@ -173,11 +137,11 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
     except Exception as exc:
         click.echo(f"  [ERROR] Conversion failed: {exc}")
         logger.debug("Conversion traceback:", exc_info=True)
-        return
+        return False
 
     if result.skipped:
         click.echo(f"  [SKIP] Already in knowledge base: {file_path.name}")
-        return
+        return False
 
     doc_name = file_path.stem
 
@@ -190,12 +154,12 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
         except Exception as exc:
             click.echo(f"  [ERROR] Indexing failed: {exc}")
             logger.debug("Indexing traceback:", exc_info=True)
-            return
+            return False
 
         summary_path = kb_dir / "wiki" / "summaries" / f"{doc_name}.md"
         click.echo(f"  Compiling long doc (doc_id={index_result.doc_id})...")
         _compile_with_retry(
-            lambda: asyncio.run(
+            lambda: _run_async_entrypoint(
                 compile_long_doc(doc_name, summary_path, index_result.doc_id, kb_dir, model,
                                  doc_description=index_result.description)
             )
@@ -203,7 +167,9 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
     else:
         click.echo(f"  Compiling short doc...")
         _compile_with_retry(
-            lambda: asyncio.run(compile_short_doc(doc_name, result.source_path, kb_dir, model))
+            lambda: _run_async_entrypoint(
+                compile_short_doc(doc_name, result.source_path, kb_dir, model)
+            )
         )
 
     # Register hash only after successful compilation
@@ -213,6 +179,26 @@ def add_single_file(file_path: Path, kb_dir: Path) -> None:
 
     append_log(kb_dir / "wiki", "ingest", file_path.name)
     click.echo(f"  [OK] {file_path.name} added to knowledge base.")
+    return True
+
+
+def _normalize_background_insights_cooldown(raw_value: object) -> int:
+    """Coerce YAML-loaded cooldown values to a safe integer boundary."""
+    default_cooldown = DEFAULT_CONFIG["insights_cooldown"]
+    if isinstance(raw_value, bool):
+        return default_cooldown
+    try:
+        parsed_value = float(raw_value)
+    except (TypeError, ValueError, OverflowError):
+        return default_cooldown
+    if not math.isfinite(parsed_value) or parsed_value < 0:
+        return default_cooldown
+    return int(parsed_value)
+
+
+def _trigger_background_insights_after_add(kb_dir: Path) -> None:
+    """Start cooldown-gated insights refresh after a successful add."""
+    maybe_trigger_insights(kb_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -263,21 +249,25 @@ def init():
         return
 
     # Interactive prompts
-    click.echo("Pick an LLM in `provider/model` LiteLLM format:")
-    click.echo("  OpenAI:    gpt-5.4-mini, gpt-5.4")
-    click.echo("  Anthropic: anthropic/claude-sonnet-4-6, anthropic/claude-opus-4-6")
-    click.echo("  Gemini:    gemini/gemini-3.1-pro-preview, gemini/gemini-3-flash-preview")
-    click.echo("  Others:    see https://docs.litellm.ai/docs/providers")
+    click.echo("Pick an executor provider and model:")
+    click.echo("  claude     -> sonnet, opus, claude-sonnet-4-6")
+    click.echo("  codex_app  -> gpt-5.4-mini, gpt-5.4")
+    click.echo("  codex      -> gpt-5.4-mini, gpt-5.4")
+    click.echo("  ollama     -> llama3, mistral, qwen2")
     click.echo()
+    provider = click.prompt(
+        f"Provider (enter for default {DEFAULT_CONFIG['provider']})",
+        default=DEFAULT_CONFIG["provider"],
+        show_default=False,
+    ).strip()
     model = click.prompt(
         f"Model (enter for default {DEFAULT_CONFIG['model']})",
         default=DEFAULT_CONFIG["model"],
         show_default=False,
-    )
-    api_key = click.prompt(
-        "LLM API Key (saved to .env, enter to skip)",
-        default="",
-        hide_input=True,
+    ).strip()
+    effort = click.prompt(
+        f"Effort (enter for default {DEFAULT_CONFIG['effort']})",
+        default=DEFAULT_CONFIG["effort"],
         show_default=False,
     ).strip()
     # Create directory structure
@@ -295,27 +285,91 @@ def init():
     # Create .openkb/ state directory
     openkb_dir.mkdir()
     config = {
+        "provider": provider or DEFAULT_CONFIG["provider"],
         "model": model,
+        "effort": effort or DEFAULT_CONFIG["effort"],
         "language": language,
         "pageindex_threshold": DEFAULT_CONFIG["pageindex_threshold"],
+        "insights_cooldown": DEFAULT_CONFIG["insights_cooldown"],
+        "background_insights_cooldown_seconds": DEFAULT_CONFIG["background_insights_cooldown_seconds"],
     }
     save_config(openkb_dir / "config.yaml", config)
     (openkb_dir / "hashes.json").write_text(json.dumps({}), encoding="utf-8")
-
-    # Write API key to KB-local .env (0600) if the user provided one
-    if api_key:
-        env_path = Path(".env")
-        if env_path.exists():
-            click.echo(".env already exists, skipping write. Add LLM_API_KEY manually if needed.")
-        else:
-            env_path.write_text(f"LLM_API_KEY={api_key}\n", encoding="utf-8")
-            os.chmod(env_path, 0o600)
-            click.echo("Saved LLM API key to .env.")
 
     # Register this KB in the global config
     register_kb(Path.cwd())
 
     click.echo("Knowledge base initialized.")
+
+
+def _coerce_config_value(value: str) -> object:
+    """Coerce CLI config values to int/float when possible."""
+    try:
+        return int(value)
+    except ValueError:
+        try:
+            return float(value)
+        except ValueError:
+            return value
+
+
+@cli.group()
+@click.pass_context
+def config(ctx):
+    """Manage OpenKB configuration."""
+
+
+@config.command("set")
+@click.argument("key")
+@click.argument("value")
+@click.pass_context
+def config_set(ctx, key, value):
+    """Set a config value: openkb config set KEY VALUE."""
+    kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
+    if kb_dir is None:
+        click.echo("No knowledge base found. Run `openkb init` first.")
+        return
+
+    config_path = kb_dir / ".openkb" / "config.yaml"
+    config_data = load_config(config_path)
+    coerced_value = _coerce_config_value(value)
+
+    config_data[key] = coerced_value
+    if key == "insights_cooldown":
+        config_data["background_insights_cooldown_seconds"] = coerced_value
+    elif key == "background_insights_cooldown_seconds":
+        config_data["insights_cooldown"] = coerced_value
+
+    save_config(config_path, config_data)
+    click.echo(f"Set {key} = {coerced_value}")
+
+
+@config.command("get")
+@click.argument("key")
+@click.pass_context
+def config_get(ctx, key):
+    """Get a config value: openkb config get KEY."""
+    kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
+    if kb_dir is None:
+        click.echo("No knowledge base found. Run `openkb init` first.")
+        return
+
+    config_data = load_config(kb_dir / ".openkb" / "config.yaml")
+    if key == "insights_cooldown":
+        value = config_data.get(
+            "insights_cooldown",
+            config_data.get(
+                "background_insights_cooldown_seconds",
+                DEFAULT_CONFIG["insights_cooldown"],
+            ),
+        )
+    else:
+        value = config_data.get(key)
+
+    if value is None:
+        click.echo(f"{key}: (not set)")
+    else:
+        click.echo(f"{key}: {value}")
 
 
 @cli.command()
@@ -343,7 +397,8 @@ def add(ctx, path):
         raw_path = raw_dir / f"{slug}.md"
         raw_path.write_text(markdown, encoding="utf-8")
         click.echo(f"  Saved to {raw_path.relative_to(kb_dir)}")
-        add_single_file(raw_path, kb_dir)
+        if add_single_file(raw_path, kb_dir):
+            _trigger_background_insights_after_add(kb_dir)
         return
 
     # --- Local file path ---
@@ -364,7 +419,8 @@ def add(ctx, path):
         click.echo(f"Found {total} supported file(s) in {path}.")
         for i, f in enumerate(files, 1):
             click.echo(f"\n[{i}/{total}] ", nl=False)
-            add_single_file(f, kb_dir)
+            if add_single_file(f, kb_dir):
+                _trigger_background_insights_after_add(kb_dir)
     else:
         if target.suffix.lower() not in SUPPORTED_EXTENSIONS:
             click.echo(
@@ -372,7 +428,8 @@ def add(ctx, path):
                 f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
             )
             return
-        add_single_file(target, kb_dir)
+        if add_single_file(target, kb_dir):
+            _trigger_background_insights_after_add(kb_dir)
 
 
 def _parse_frontmatter(path: Path) -> dict | None:
@@ -394,16 +451,18 @@ def _parse_frontmatter(path: Path) -> dict | None:
 
 
 @cli.command("add-sources")
-@click.argument("source_dir", type=click.Path(exists=True, file_okay=False))
+@click.argument("source_dir", required=False, type=click.Path(exists=True, file_okay=False))
 @click.option("--type", "source_type_filter", default=None,
               help="Only add URLs with this source_type (e.g. twitter, youtube, article).")
 @click.option("--limit", "max_count", type=int, default=None,
               help="Maximum number of URLs to process.")
 @click.option("--dry-run", is_flag=True, default=False,
               help="Show what would be added without fetching.")
+@click.option("--concurrency", "max_workers", type=int, default=1,
+              help="Number of parallel compilation workers (default: 1).")
 @click.pass_context
-def add_sources(ctx, source_dir, source_type_filter, max_count, dry_run):
-    """Scan PKM-source directory for URLs in frontmatter and add them to the KB."""
+def add_sources(ctx, source_dir, source_type_filter, max_count, dry_run, max_workers):
+    """Scan a source directory for frontmatter URLs and add them to the KB."""
     kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
     if kb_dir is None:
         click.echo("No knowledge base found. Run `openkb init` first.")
@@ -411,7 +470,10 @@ def add_sources(ctx, source_dir, source_type_filter, max_count, dry_run):
 
     from openkb.url_fetch import is_url, fetch_url, FetchError
 
-    source_path = Path(source_dir)
+    source_path = Path(source_dir) if source_dir else (kb_dir / "sources")
+    if not source_path.exists():
+        click.echo(f"Source directory not found: {source_path}")
+        return
     md_files = sorted(source_path.rglob("*.md"))
 
     urls_to_add: list[tuple[str, str, Path]] = []  # (url, source_type, source_file)
@@ -439,17 +501,48 @@ def add_sources(ctx, source_dir, source_type_filter, max_count, dry_run):
     raw_dir = kb_dir / "raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
-    for i, (url, stype, src_file) in enumerate(urls_to_add, 1):
-        click.echo(f"\n[{i}/{len(urls_to_add)}] [{stype}] {url}")
+    def _process_one(item: tuple[int, str, str, Path]) -> str:
+        """Fetch + compile a single URL. Returns status string."""
+        i, url, stype, src_file = item
+        tag = f"[{i}/{len(urls_to_add)}]"
         try:
             markdown, slug = fetch_url(url)
         except FetchError as exc:
-            click.echo(f"  [ERROR] {exc}")
-            continue
+            return f"{tag} [ERROR] {exc}"
         raw_path = raw_dir / f"{slug}.md"
         raw_path.write_text(markdown, encoding="utf-8")
-        click.echo(f"  Saved to {raw_path.relative_to(kb_dir)}")
-        add_single_file(raw_path, kb_dir)
+        # add_single_file uses click.echo which is not thread-safe,
+        # so redirect output to a buffer and print from main thread.
+        import io
+        buf = io.StringIO()
+        old_echo = click.echo
+        click.echo = lambda msg, **kw: buf.write(str(msg) + "\n")
+        try:
+            add_single_file(raw_path, kb_dir)
+        finally:
+            click.echo = old_echo
+        output = buf.getvalue()
+        # Determine result from output
+        if "[SKIP]" in output:
+            return f"{tag} [SKIP] {slug}"
+        if "[ERROR]" in output:
+            return f"{tag} [ERROR] {slug}: {output.strip()[-200:]}"
+        return f"{tag} [OK] {slug}"
+
+    items = [(i, url, stype, src_file) for i, (url, stype, src_file) in enumerate(urls_to_add, 1)]
+
+    if max_workers > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        click.echo(f"Using {max_workers} parallel workers.")
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_process_one, item): item for item in items}
+            for future in as_completed(futures):
+                result = future.result()
+                click.echo(result)
+    else:
+        for item in items:
+            result = _process_one(item)
+            click.echo(result)
 
 
 @cli.command()
@@ -472,7 +565,6 @@ def query(ctx, question, save, raw):
 
     openkb_dir = kb_dir / ".openkb"
     config = load_config(openkb_dir / "config.yaml")
-    _setup_llm_key(kb_dir)
     model: str = config.get("model", DEFAULT_CONFIG["model"])
 
     try:
@@ -493,6 +585,37 @@ def query(ctx, question, save, raw):
             f"---\nquery: \"{question}\"\n---\n\n{answer}\n", encoding="utf-8"
         )
         click.echo(f"\nSaved to {explore_path}")
+
+
+@cli.command()
+@click.argument("path")
+@click.option(
+    "--mode",
+    "mode",
+    required=True,
+    type=click.Choice(["query_page", "concept_seed"], case_sensitive=False),
+    help="Promotion target mode.",
+)
+@click.pass_context
+def promote(ctx, path, mode):
+    """Promote a saved exploration into a durable query page or concept seed."""
+    kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
+    if kb_dir is None:
+        click.echo("No knowledge base found. Run `openkb init` first.")
+        return
+
+    from openkb.promotion import promote_exploration
+
+    try:
+        result = promote_exploration(kb_dir, path, mode=mode)
+    except (FileNotFoundError, ValueError) as exc:
+        click.echo(f"[ERROR] Promotion failed: {exc}")
+        return
+
+    if mode == "query_page":
+        click.echo(f"Promoted exploration to query page: {result['target_path']}")
+    else:
+        click.echo(f"Queued concept seed review item: {result['target_path']}")
 
 
 @cli.command()
@@ -573,7 +696,6 @@ def chat(ctx, resume, list_sessions_flag, delete_id, no_color, raw):
 
     openkb_dir = kb_dir / ".openkb"
     config = load_config(openkb_dir / "config.yaml")
-    _setup_llm_key(kb_dir)
 
     if resume is not None:
         try:
@@ -653,7 +775,6 @@ async def run_lint(kb_dir: Path) -> Path | None:
         return
 
     config = load_config(openkb_dir / "config.yaml")
-    _setup_llm_key(kb_dir)
     model: str = config.get("model", DEFAULT_CONFIG["model"])
 
     click.echo("Running structural lint...")
@@ -692,6 +813,45 @@ def lint(ctx, fix):
         click.echo("No knowledge base found. Run `openkb init` first.")
         return
     asyncio.run(run_lint(kb_dir))
+
+
+@cli.command()
+@click.pass_context
+def quality(ctx):
+    """Aggregate current KB quality signals into one latest report."""
+    kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
+    if kb_dir is None:
+        click.echo("No knowledge base found. Run `openkb init` first.")
+        return
+
+    from openkb.quality_loop import run_quality_convergence
+
+    config = load_config(kb_dir / ".openkb" / "config.yaml")
+    model: str = config.get("model", DEFAULT_CONFIG["model"])
+    result = run_quality_convergence(kb_dir, model)
+    click.echo(f"Structural issues: {result['structural_issue_count']}")
+    click.echo(f"Semantic report: {result['semantic_report']}")
+    click.echo(f"Pending review items: {result['pending_review_count']}")
+    click.echo(result["insights"]["summary"])
+    click.echo(f"Quality report: {result['quality_report']}")
+
+
+@cli.command()
+@click.option("--plan", "plan_only", is_flag=True, default=False, help="Show stale refresh plan.")
+@click.pass_context
+def refresh(ctx, plan_only):
+    """Show stale pages that should be refreshed."""
+    kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
+    if kb_dir is None:
+        click.echo("No knowledge base found. Run `openkb init` first.")
+        return
+    if not plan_only:
+        click.echo("This stage only supports planning. Re-run with --plan.")
+        return
+
+    from openkb.refresh import collect_stale_pages, render_refresh_plan
+
+    click.echo(render_refresh_plan(collect_stale_pages(kb_dir)))
 
 
 def print_list(kb_dir: Path) -> None:
@@ -812,9 +972,10 @@ def print_status(kb_dir: Path) -> None:
 
 @cli.command()
 @click.option("--accept", "accept_idx", type=int, default=None, help="Accept and remove the item at the given index.")
+@click.option("--apply", "apply_idx", type=int, default=None, help="Apply the item action and remove it on success.")
 @click.option("--skip", "skip_idx", type=int, default=None, help="Skip and remove the item at the given index.")
 @click.pass_context
-def review(ctx, accept_idx, skip_idx):
+def review(ctx, accept_idx, apply_idx, skip_idx):
     """Review pending items from the analysis step."""
     kb_dir = _find_kb_dir(ctx.obj.get("kb_dir_override"))
     if kb_dir is None:
@@ -824,13 +985,36 @@ def review(ctx, accept_idx, skip_idx):
     openkb_dir = kb_dir / ".openkb"
     queue = ReviewQueue(openkb_dir)
     items = queue.list()
+    operation_count = sum(idx is not None for idx in (accept_idx, apply_idx, skip_idx))
+    if operation_count > 1:
+        click.echo("Choose only one of --accept, --apply, or --skip.")
+        return
 
     if accept_idx is not None:
         if not items or accept_idx < 0 or accept_idx >= len(items):
             click.echo("Invalid index. No item at that position.")
             return
         item = queue.accept(accept_idx)
-        click.echo(f"Accepted: [{item.type}] {item.title}\n  {item.description}")
+        click.echo(
+            f"Accepted without applying changes: [{item.type}] {item.title}\n"
+            f"  {item.description}"
+        )
+        return
+
+    if apply_idx is not None:
+        if not items or apply_idx < 0 or apply_idx >= len(items):
+            click.echo("Invalid index. No item at that position.")
+            return
+        try:
+            item = queue.apply(apply_idx, lambda queued_item: apply_review_action(kb_dir, queued_item))
+        except Exception as exc:
+            click.echo(f"[ERROR] Failed to apply review item at index {apply_idx}: {exc}")
+            return
+        click.echo(
+            f"Applied: [{item.type}] {item.title}\n"
+            f"  Action: {item.action_type}\n"
+            f"  {item.description}"
+        )
         return
 
     if skip_idx is not None:
@@ -849,6 +1033,8 @@ def review(ctx, accept_idx, skip_idx):
     for i, item in enumerate(items):
         click.echo(f"  [{i}] ({item.type}) {item.title}")
         click.echo(f"      {item.description}")
+        if item.action_type:
+            click.echo(f"      Action: {item.action_type} [{item.status}]")
         if item.affected_pages:
             click.echo(f"      Affected: {', '.join(item.affected_pages)}")
         click.echo()
@@ -874,19 +1060,22 @@ def insights(ctx):
         click.echo("No knowledge base found. Run `openkb init` first.")
         return
 
-    from openkb.graph.build import build_graph, load_graph, build_and_save_graph
+    from openkb.graph.build import build_graph, load_graph, build_and_save_graph, GraphLoadError
     from openkb.graph.insights import generate_insights
 
     wiki_dir = kb_dir / "wiki"
     graph_path = kb_dir / ".openkb" / "graph.json"
 
     # Load or build graph
-    if graph_path.exists():
-        graph = load_graph(graph_path)
-    else:
-        openkb_dir = kb_dir / ".openkb"
-        build_and_save_graph(wiki_dir, openkb_dir)
-        graph = load_graph(graph_path)
+    try:
+        if graph_path.exists():
+            graph = load_graph(graph_path)
+        else:
+            openkb_dir = kb_dir / ".openkb"
+            graph, _ = build_and_save_graph(wiki_dir, openkb_dir)
+    except GraphLoadError:
+        click.echo("graph.json이 손상되었습니다. `openkb add`로 재생성하세요.")
+        return
 
     if graph.number_of_nodes() == 0:
         click.echo("No graph data. Add documents first with `openkb add`.")

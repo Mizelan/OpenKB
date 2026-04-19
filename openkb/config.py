@@ -11,6 +11,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "effort": "medium",
     "language": "en",
     "pageindex_threshold": 20,
+    "insights_cooldown": 3600,
+    "background_insights_cooldown_seconds": 3600,
 }
 
 GLOBAL_CONFIG_DIR = Path.home() / ".config" / "openkb"
@@ -23,10 +25,15 @@ def load_config(config_path: Path) -> dict[str, Any]:
     If the file does not exist, returns a copy of the defaults.
     """
     config = dict(DEFAULT_CONFIG)
+    data: dict[str, Any] = {}
     if config_path.exists():
         with config_path.open("r", encoding="utf-8") as fh:
             data = yaml.safe_load(fh) or {}
         config.update(data)
+    if "insights_cooldown" not in data and "background_insights_cooldown_seconds" in data:
+        config["insights_cooldown"] = config["background_insights_cooldown_seconds"]
+    elif "background_insights_cooldown_seconds" not in data and "insights_cooldown" in data:
+        config["background_insights_cooldown_seconds"] = config["insights_cooldown"]
     return config
 
 

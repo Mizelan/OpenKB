@@ -8,6 +8,7 @@ stdout to preserve the existing ``query`` visual.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import sys
@@ -23,8 +24,9 @@ from prompt_toolkit.shortcuts import CompleteStyle, print_formatted_text
 from prompt_toolkit.styles import Style
 
 from openkb.agent.chat_session import ChatSession
-from openkb.agent.query import MAX_TURNS, build_query_agent
+from openkb.agent.query import build_query_agent
 from openkb.log import append_log
+from openkb.promotion import latest_exploration_path, promote_exploration
 
 
 _STYLE_DICT: dict[str, str] = {
@@ -55,6 +57,7 @@ _HELP_TEXT = (
     "  /exit          Exit (Ctrl-D also works)\n"
     "  /clear         Start a fresh session (current one is kept on disk)\n"
     "  /save [name]   Export transcript to wiki/explorations/\n"
+    "  /promote latest <mode>  Promote latest exploration to query_page or concept_seed\n"
     "  /status        Show knowledge base status\n"
     "  /list          List all documents in the knowledge base\n"
     "  /lint          Lint the knowledge base\n"
@@ -200,6 +203,7 @@ _SLASH_COMMANDS: list[tuple[str, str]] = [
     ("/help",   "Show available commands"),
     ("/clear",  "Start a fresh session"),
     ("/save",   "Export transcript to wiki/explorations/"),
+    ("/promote","Promote latest exploration"),
     ("/status", "Show knowledge base status"),
     ("/list",   "List all documents"),
     ("/lint",   "Lint the knowledge base"),
@@ -309,99 +313,48 @@ async def _run_turn(
     agent: Any, session: ChatSession, user_input: str, style: Style,
     *, use_color: bool = True, raw: bool = False,
 ) -> None:
-    """Run one agent turn with streaming output and persist the new history."""
-    from agents import (
-        RawResponsesStreamEvent,
-        RunItemStreamEvent,
-        Runner,
-    )
-    from openai.types.responses import ResponseTextDeltaEvent
-
-    new_input = session.history + [{"role": "user", "content": user_input}]
-
-    result = Runner.run_streamed(agent, new_input, max_turns=MAX_TURNS)
+    """Run one executor turn and persist the new provider-agnostic history."""
+    from openkb.agent.executor_runtime import run_executor_agent
 
     print()
-    collected: list[str] = []
-    segment: list[str] = []
-    last_was_text = False
-    need_blank_before_text = False
+    streamed_text = False
 
-    if use_color and not raw:
-        from rich.console import Console
-        from rich.live import Live
+    def _emit_tool_call(name: str, args: dict[str, Any], reason: str) -> None:
+        arg_text = json.dumps(args, ensure_ascii=False, sort_keys=True)
+        line = _format_tool_line(name, arg_text)
+        if reason:
+            line = f"{reason} {line}"
+        _fmt(style, ("class:tool", line + "\n"))
 
+    def _emit_text_delta(text: str) -> None:
+        nonlocal streamed_text
+        if not text:
+            return
+        streamed_text = True
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    result = await run_executor_agent(
+        agent,
+        user_input,
+        history=session.history,
+        on_tool_call=_emit_tool_call,
+        on_text_delta=_emit_text_delta,
+    )
+
+    answer = result.final_output.strip()
+    if streamed_text:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    elif use_color and not raw:
         console = _make_rich_console()
+        console.print(_make_markdown(answer))
     else:
-        console = None  # type: ignore[assignment]
+        sys.stdout.write(answer + "\n")
+        sys.stdout.flush()
+    print()
 
-    def _start_live() -> Any:
-        if console is None:
-            return None
-        lv = Live(console=console, vertical_overflow="visible")
-        lv.start()
-        return lv
-
-    live = _start_live()
-
-    try:
-        async for event in result.stream_events():
-            if isinstance(event, RawResponsesStreamEvent):
-                if isinstance(event.data, ResponseTextDeltaEvent):
-                    text = event.data.delta
-                    if text:
-                        if need_blank_before_text:
-                            if console is not None:
-                                print()
-                                segment = []
-                                live = _start_live()
-                            else:
-                                sys.stdout.write("\n")
-                            need_blank_before_text = False
-                        collected.append(text)
-                        segment.append(text)
-                        last_was_text = True
-                        if live:
-                            if "\n" in text:
-                                joined = "".join(segment)
-                                visible = joined[: joined.rfind("\n") + 1]
-                                if visible:
-                                    live.update(_make_markdown(visible))
-                        else:
-                            sys.stdout.write(text)
-                            sys.stdout.flush()
-            elif isinstance(event, RunItemStreamEvent):
-                item = event.item
-                if item.type == "tool_call_item":
-                    if last_was_text:
-                        if live:
-                            if segment:
-                                live.update(_make_markdown("".join(segment)))
-                            live.stop()
-                            live = None
-                        else:
-                            sys.stdout.write("\n")
-                            sys.stdout.flush()
-                        last_was_text = False
-                    raw_item = item.raw_item
-                    name = getattr(raw_item, "name", "?")
-                    args = getattr(raw_item, "arguments", "") or ""
-                    if live:
-                        live.stop()
-                        live = None
-                    _fmt(style, ("class:tool", _format_tool_line(name, args) + "\n"))
-                    need_blank_before_text = True
-    finally:
-        if live:
-            if segment:
-                live.update(_make_markdown("".join(segment)))
-            live.stop()
-        print()
-
-    answer = "".join(collected).strip()
-    if not answer:
-        answer = (result.final_output or "").strip()
-    session.record_turn(user_input, answer, result.to_input_list())
+    session.record_turn(user_input, answer, result.history)
 
 
 def _save_transcript(kb_dir: Path, session: ChatSession, name: str | None) -> Path:
@@ -507,6 +460,33 @@ async def _handle_slash(
         _fmt(style, ("class:slash.ok", f"Saved to {path}\n"))
         return None
 
+    if head == "/promote":
+        promote_parts = arg.split()
+        if len(promote_parts) != 2 or promote_parts[0].lower() != "latest":
+            _fmt(style, ("class:error", "Usage: /promote latest <query_page|concept_seed>\n"))
+            return None
+        mode = promote_parts[1].strip().lower()
+        if mode not in {"query_page", "concept_seed"}:
+            _fmt(style, ("class:error", "Mode must be query_page or concept_seed.\n"))
+            return None
+        try:
+            latest_rel = latest_exploration_path(kb_dir)
+            result = promote_exploration(kb_dir, latest_rel, mode=mode)
+        except (FileNotFoundError, ValueError) as exc:
+            _fmt(style, ("class:error", f"Promotion failed: {exc}\n"))
+            return None
+        if mode == "query_page":
+            _fmt(
+                style,
+                ("class:slash.ok", f"Promoted latest exploration to query page: {result['target_path']}\n"),
+            )
+        else:
+            _fmt(
+                style,
+                ("class:slash.ok", f"Queued concept seed from latest exploration: {result['target_path']}\n"),
+            )
+        return None
+
     if head == "/status":
         from openkb.cli import print_status
         print_status(kb_dir)
@@ -551,8 +531,16 @@ async def run_chat(
 
     config = load_config(kb_dir / ".openkb" / "config.yaml")
     language = session.language or config.get("language", "en")
+    provider = config.get("provider", "")
+    effort = config.get("effort", "medium")
     wiki_root = str(kb_dir / "wiki")
-    agent = build_query_agent(wiki_root, session.model, language=language)
+    agent = build_query_agent(
+        wiki_root,
+        session.model,
+        language=language,
+        provider=provider,
+        effort=effort,
+    )
 
     _print_header(session, kb_dir, style)
     if session.turn_count > 0:
@@ -592,7 +580,13 @@ async def run_chat(
                 return
             if action == "new_session":
                 session = ChatSession.new(kb_dir, session.model, session.language)
-                agent = build_query_agent(wiki_root, session.model, language=language)
+                agent = build_query_agent(
+                    wiki_root,
+                    session.model,
+                    language=language,
+                    provider=provider,
+                    effort=effort,
+                )
                 prompt_session = _make_prompt_session(session, style, use_color, kb_dir)
             continue
 

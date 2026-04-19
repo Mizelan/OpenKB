@@ -3,8 +3,25 @@ from __future__ import annotations
 
 import logging
 import shutil
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"builtin type SwigPyPacked has no __module__ attribute",
+    category=DeprecationWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"builtin type SwigPyObject has no __module__ attribute",
+    category=DeprecationWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"builtin type swigvarlink has no __module__ attribute",
+    category=DeprecationWarning,
+)
 
 import pymupdf
 from markitdown import MarkItDown

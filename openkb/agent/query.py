@@ -1,15 +1,16 @@
 """Q&A agent for querying the OpenKB knowledge base."""
 from __future__ import annotations
 
+import json
+import os
+import sys
 from pathlib import Path
 
-from agents import Agent, Runner, function_tool
-
-from agents import ToolOutputImage, ToolOutputText
+from openkb.agent.executor_runtime import ExecutorAgent, ExecutorTool, run_executor_agent
 from openkb.agent.tools import get_wiki_page_content, read_wiki_file, read_wiki_image, search_related_pages
+from openkb.schema import get_agents_md
 
 MAX_TURNS = 50
-from openkb.schema import get_agents_md
 
 _QUERY_INSTRUCTIONS_TEMPLATE = """\
 You are OpenKB, a knowledge-base Q&A agent. You answer questions by searching the wiki.
@@ -33,79 +34,79 @@ You are OpenKB, a knowledge-base Q&A agent. You answer questions by searching th
     related pages via the knowledge graph. This expands your coverage beyond
     direct wikilinks and can surface pages that share sources or neighbours.
 5. Source content may reference images (e.g. ![image](sources/images/doc/file.png)).
-   Use the get_image tool to view them when needed.
+   Use the get_image tool when needed. Some executor providers may return a text
+   fallback instead of inline image bytes, so answer conservatively when image
+   evidence is incomplete.
 6. Synthesize a clear, concise, well-cited answer grounded in wiki content.
 
 Answer based only on wiki content. Be concise.
-Before each tool call, output one short sentence explaining the reason.
-
 If you cannot find relevant information, say so clearly.
 """
 
 
-def build_query_agent(wiki_root: str, model: str, language: str = "en") -> Agent:
+def build_query_agent(
+    wiki_root: str,
+    model: str,
+    language: str = "en",
+    *,
+    provider: str = "",
+    effort: str = "medium",
+) -> ExecutorAgent:
     """Build and return the Q&A agent."""
     schema_md = get_agents_md(Path(wiki_root))
     instructions = _QUERY_INSTRUCTIONS_TEMPLATE.format(schema_md=schema_md)
     instructions += f"\n\nIMPORTANT: Answer in {language} language."
 
-    @function_tool
     def read_file(path: str) -> str:
-        """Read a Markdown file from the wiki.
-        Args:
-            path: File path relative to wiki root (e.g. 'summaries/paper.md').
-        """
         return read_wiki_file(path, wiki_root)
 
-    @function_tool
     def get_page_content(doc_name: str, pages: str) -> str:
-        """Get text content of specific pages from a PageIndex (long) document.
-        Only use for documents with doc_type: pageindex. For short documents,
-        use read_file instead.
-        Args:
-            doc_name: Document name (e.g. 'attention-is-all-you-need').
-            pages: Page specification (e.g. '3-5,7,10-12').
-        """
         return get_wiki_page_content(doc_name, pages, wiki_root)
 
-    @function_tool
-    def get_image(image_path: str) -> ToolOutputImage | ToolOutputText:
-        """View an image from the wiki.
-
-        Use when a question asks about a specific figure, chart, or diagram
-        you'd need to see to answer accurately.
-
-        Args:
-            image_path: Image path relative to wiki root (e.g. 'sources/images/doc/p1_img1.png').
-        """
+    def get_image(image_path: str) -> str:
         result = read_wiki_image(image_path, wiki_root)
         if result["type"] == "image":
-            return ToolOutputImage(image_url=result["image_url"])
-        return ToolOutputText(text=result["text"])
+            return (
+                f"Image available at {image_path}. "
+                "Executor mode does not inline the raw image bytes in the transcript."
+            )
+        return result["text"]
 
     kb_dir = str(Path(wiki_root).parent)
 
-    @function_tool
     def search_related(page_name: str, top_k: int = 5) -> str:
-        """Find related wiki pages using the knowledge graph.
-
-        Use after identifying relevant concepts to discover indirectly related
-        pages that share sources or graph neighbours.
-
-        Args:
-            page_name: Wiki page slug (e.g. 'concepts/attention').
-            top_k: Maximum number of related pages to return (default 5).
-        """
         return search_related_pages(page_name, top_k, kb_dir)
 
-    from agents.model_settings import ModelSettings
-
-    return Agent(
+    return ExecutorAgent(
         name="wiki-query",
         instructions=instructions,
-        tools=[read_file, get_page_content, get_image, search_related],
-        model=f"litellm/{model}",
-        model_settings=ModelSettings(parallel_tool_calls=False),
+        tools=[
+            ExecutorTool(
+                name="read_file",
+                description="Read a Markdown file from the wiki by relative path.",
+                handler=read_file,
+            ),
+            ExecutorTool(
+                name="get_page_content",
+                description="Read specific page ranges from a PageIndex document.",
+                handler=get_page_content,
+            ),
+            ExecutorTool(
+                name="get_image",
+                description="Inspect an image reference from the wiki. May return a text fallback in executor mode.",
+                handler=get_image,
+            ),
+            ExecutorTool(
+                name="search_related",
+                description="Find related pages using the knowledge graph.",
+                handler=search_related,
+            ),
+        ],
+        model=model,
+        provider=provider,
+        effort=effort,
+        working_dir=kb_dir,
+        max_turns=MAX_TURNS,
     )
 
 
@@ -117,123 +118,66 @@ async def run_query(
     *,
     raw: bool = False,
 ) -> str:
-    """Run a Q&A query against the knowledge base.
-
-    Args:
-        question: The user's question.
-        kb_dir: Root of the knowledge base.
-        model: LLM model name.
-        stream: If True, print response tokens to stdout as they arrive.
-        raw: If True, write raw markdown source instead of rendering it
-            (still keeps tool-call line styling).
-
-    Returns:
-        The agent's final answer as a string.
-    """
-    import sys
-    from agents import RawResponsesStreamEvent, RunItemStreamEvent, ItemHelpers
-    from openai.types.responses import ResponseTextDeltaEvent
+    """Run a Q&A query against the knowledge base."""
     from openkb.config import load_config
 
     openkb_dir = kb_dir / ".openkb"
     config = load_config(openkb_dir / "config.yaml")
     language: str = config.get("language", "en")
-
+    provider: str = config.get("provider", "")
+    effort: str = config.get("effort", "medium")
     wiki_root = str(kb_dir / "wiki")
 
-    agent = build_query_agent(wiki_root, model, language=language)
-
-    if not stream:
-        result = await Runner.run(agent, question, max_turns=MAX_TURNS)
-        return result.final_output or ""
-
-    import os
-    use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR", "")
-
-    from openkb.agent.chat import (
-        _build_style,
-        _fmt,
-        _format_tool_line,
-        _make_markdown,
-        _make_rich_console,
+    agent = build_query_agent(
+        wiki_root,
+        model,
+        language=language,
+        provider=provider,
+        effort=effort,
     )
 
-    style = _build_style(use_color)
+    use_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR", "")
+    streamed_text = False
 
-    from rich.live import Live
+    def _emit_tool_call(name: str, args: dict[str, object], reason: str) -> None:
+        if not stream:
+            return
+        from openkb.agent.chat import _build_style, _fmt, _format_tool_line
 
-    if use_color and not raw:
-        console = _make_rich_console()
-    else:
-        console = None  # type: ignore[assignment]
+        arg_text = json.dumps(args, ensure_ascii=False, sort_keys=True)
+        style = _build_style(use_color)
+        line = _format_tool_line(name, arg_text)
+        if reason:
+            line = f"{reason} {line}"
+        _fmt(style, ("class:tool", line + "\n"))
 
-    def _start_live() -> Live | None:
-        if console is None:
-            return None
-        lv = Live(console=console, vertical_overflow="visible")
-        lv.start()
-        return lv
+    def _emit_text_delta(text: str) -> None:
+        nonlocal streamed_text
+        if not stream or not text:
+            return
+        streamed_text = True
+        sys.stdout.write(text)
+        sys.stdout.flush()
 
-    live: Live | None = None
-    last_was_text = False
-    need_blank_before_text = False
-    result = Runner.run_streamed(agent, question, max_turns=MAX_TURNS)
-    collected: list[str] = []
-    segment: list[str] = []
-    try:
-        live = _start_live()
-        async for event in result.stream_events():
-            if isinstance(event, RawResponsesStreamEvent):
-                if isinstance(event.data, ResponseTextDeltaEvent):
-                    text = event.data.delta
-                    if text:
-                        if need_blank_before_text:
-                            if console is not None:
-                                print()
-                                segment = []
-                                live = _start_live()
-                            else:
-                                sys.stdout.write("\n")
-                            need_blank_before_text = False
-                        collected.append(text)
-                        segment.append(text)
-                        last_was_text = True
-                        if live:
-                            if "\n" in text:
-                                joined = "".join(segment)
-                                visible = joined[: joined.rfind("\n") + 1]
-                                if visible:
-                                    live.update(_make_markdown(visible))
-                        else:
-                            sys.stdout.write(text)
-                            sys.stdout.flush()
-            elif isinstance(event, RunItemStreamEvent):
-                item = event.item
-                if item.type == "tool_call_item":
-                    if last_was_text:
-                        if live:
-                            if segment:
-                                live.update(_make_markdown("".join(segment)))
-                            live.stop()
-                            live = None
-                        else:
-                            sys.stdout.write("\n")
-                            sys.stdout.flush()
-                        last_was_text = False
-                    raw_item = item.raw_item
-                    name = getattr(raw_item, "name", "?")
-                    args = getattr(raw_item, "arguments", "") or ""
-                    if live:
-                        live.stop()
-                        live = None
-                    _fmt(style, ("class:tool", _format_tool_line(name, args) + "\n"))
-                    need_blank_before_text = True
-                elif item.type == "tool_call_output_item":
-                    pass
-    finally:
-        if live:
-            if segment:
-                live.update(_make_markdown("".join(segment)))
-            live.stop()
-        print()
-    return "".join(collected) if collected else result.final_output or ""
+    result = await run_executor_agent(
+        agent,
+        question,
+        on_tool_call=_emit_tool_call if stream else None,
+        on_text_delta=_emit_text_delta if stream else None,
+    )
+    answer = result.final_output or ""
+
+    if stream and streamed_text:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    elif stream:
+        from openkb.agent.chat import _make_markdown, _make_rich_console
+
+        if use_color and not raw:
+            console = _make_rich_console()
+            console.print(_make_markdown(answer))
+        else:
+            sys.stdout.write(answer + "\n")
+            sys.stdout.flush()
+
+    return answer

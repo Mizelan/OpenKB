@@ -13,6 +13,8 @@ from pathlib import Path
 
 import networkx as nx
 
+from openkb.frontmatter import parse_fm
+
 logger = logging.getLogger(__name__)
 
 # Regex for [[target]] wikilinks
@@ -22,47 +24,8 @@ _WIKILINK_RE = re.compile(r"\[\[([^\]]+)\]\]")
 _WIKI_SUBDIRS = ("summaries", "concepts", "explorations")
 
 
-def _parse_frontmatter(text: str) -> tuple[dict, str]:
-    """Parse YAML frontmatter from markdown text.
-
-    Returns (metadata_dict, body_text). If no frontmatter, returns ({}, text).
-    Mirrors compiler.py's _split_frontmatter pattern but extracts structured data.
-    """
-    if not text.startswith("---"):
-        return {}, text
-
-    end = text.find("---", 3)
-    if end == -1:
-        return {}, text
-
-    fm_block = text[3:end].strip()
-    body = text[end + 3:].lstrip("\n")
-
-    meta: dict = {}
-    sources: list[str] = []
-    in_sources_list = False
-    for line in fm_block.split("\n"):
-        line = line.strip()
-        if line.startswith("entity_type:"):
-            meta["entity_type"] = line[len("entity_type:"):].strip().strip("\"'")
-        elif line.startswith("brief:"):
-            meta["brief"] = line[len("brief:"):].strip().strip("\"'")
-        elif line.startswith("sources:"):
-            in_sources_list = True
-            src_part = line[len("sources:"):].strip()
-            if src_part.startswith("[") and src_part.endswith("]"):
-                inner = src_part[1:-1]
-                sources = [s.strip().strip("\"'") for s in inner.split(",") if s.strip()]
-                in_sources_list = False
-        elif in_sources_list and line.startswith("- "):
-            val = line[2:].strip().strip("\"'")
-            if val:
-                sources.append(val)
-        else:
-            in_sources_list = False
-
-    meta["sources"] = sources
-    return meta, body
+class GraphLoadError(Exception):
+    """Raised when graph.json cannot be loaded (corrupted or missing)."""
 
 
 def _node_id(rel_path: str) -> str:
@@ -76,8 +39,8 @@ def build_graph(wiki_dir: Path) -> nx.Graph:
     """Build a networkx Graph from wiki/ markdown files.
 
     Nodes are wiki page slugs (e.g. 'concepts/attention').
-    Edges carry attributes: edge_type (wikilink or source_overlap), weight.
-    Node attributes: entity_type, brief, sources.
+    Edges carry attributes: edge_type (wikilink, source_overlap, entity_mention), weight.
+    Node attributes: entity_type, brief, sources, mentioned_entities.
     """
     g = nx.Graph()
 
@@ -92,7 +55,7 @@ def build_graph(wiki_dir: Path) -> nx.Graph:
             rel = md_file.relative_to(wiki_dir)
             nid = _node_id(str(rel))
             text = md_file.read_text(encoding="utf-8")
-            meta, body = _parse_frontmatter(text)
+            meta, body = parse_fm(text)
 
             # Extract wikilinks from body
             targets = []
@@ -108,10 +71,18 @@ def build_graph(wiki_dir: Path) -> nx.Graph:
                 "body": body,
                 "targets": targets,
             }
+
+            # Extract mentioned entity names for relevance signal
+            ent_names = []
+            for ent in meta.get("entities", []):
+                if isinstance(ent, dict) and "name" in ent:
+                    ent_names.append(ent["name"])
+
             g.add_node(nid,
                        entity_type=meta.get("entity_type", ""),
                        brief=meta.get("brief", ""),
-                       sources=meta.get("sources", []))
+                       sources=meta.get("sources", []),
+                       mentioned_entities=ent_names)
 
     # Add wikilink edges
     for nid, data in page_data.items():
@@ -120,7 +91,7 @@ def build_graph(wiki_dir: Path) -> nx.Graph:
                 continue  # skip self-loops
             # Create placeholder node if target doesn't exist
             if target not in g.nodes:
-                g.add_node(target, entity_type="", brief="", sources=[])
+                g.add_node(target, entity_type="", brief="", sources=[], mentioned_entities=[])
             if not g.has_edge(nid, target):
                 g.add_edge(nid, target, edge_type="wikilink", weight=1)
 
@@ -145,6 +116,27 @@ def build_graph(wiki_dir: Path) -> nx.Graph:
                     g[a][b]["edge_type"] = "wikilink+source_overlap"
                 else:
                     g.add_edge(a, b, edge_type="source_overlap", weight=1)
+
+    # Add entity_mention edges
+    entity_to_nodes: dict[str, list[str]] = {}
+    for nid, data in page_data.items():
+        for ent in data["meta"].get("entities", []):
+            if isinstance(ent, dict) and "name" in ent and "type" in ent:
+                key = f"{ent['name']}|{ent['type']}"
+                entity_to_nodes.setdefault(key, []).append(nid)
+
+    for key, nodes in entity_to_nodes.items():
+        for i in range(len(nodes)):
+            for j in range(i + 1, len(nodes)):
+                a, b = nodes[i], nodes[j]
+                if g.has_edge(a, b):
+                    edge_data = g.get_edge_data(a, b)
+                    current_weight = edge_data.get("weight", 1)
+                    g[a][b]["weight"] = current_weight + 1
+                    existing_type = edge_data.get("edge_type", "wikilink")
+                    g[a][b]["edge_type"] = f"{existing_type}+entity_mention"
+                else:
+                    g.add_edge(a, b, edge_type="entity_mention", weight=1)
 
     return g
 
@@ -182,12 +174,13 @@ def save_graph(graph: nx.Graph, path: Path) -> None:
 
 
 def load_graph(path: Path) -> nx.Graph:
-    """Deserialise graph from JSON file."""
+    """Deserialise graph from JSON file. Raises GraphLoadError on failure."""
+    if not path.exists():
+        raise GraphLoadError(str(path), "File not found")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError) as exc:
-        logger.warning("Failed to load graph from %s: %s", path, exc)
-        return nx.Graph()
+        raise GraphLoadError(str(path), str(exc)) from exc
     g = nx.Graph()
 
     for nid, attr in data.get("nodes", {}).items():
@@ -206,8 +199,8 @@ def load_graph(path: Path) -> nx.Graph:
     return g
 
 
-def build_and_save_graph(wiki_dir: Path, openkb_dir: Path | None = None) -> Path:
-    """Build graph and save to .openkb/graph.json. Returns path to graph.json."""
+def build_and_save_graph(wiki_dir: Path, openkb_dir: Path | None = None) -> tuple[nx.Graph, Path]:
+    """Build graph and save to .openkb/graph.json. Returns (graph, path)."""
     if openkb_dir is None:
         # Walk up from wiki_dir to find .openkb
         current = wiki_dir.parent
@@ -224,4 +217,4 @@ def build_and_save_graph(wiki_dir: Path, openkb_dir: Path | None = None) -> Path
     save_graph(g, graph_path)
     logger.info("Graph built: %d nodes, %d edges → %s",
                 g.number_of_nodes(), g.number_of_edges(), graph_path)
-    return graph_path
+    return g, graph_path

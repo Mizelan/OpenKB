@@ -12,12 +12,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import sys
 import time
 import unicodedata
 from pathlib import Path
 
+from openkb.frontmatter import parse_fm, serialize_fm
 from openkb.json_utils import extract_json
 from openkb.schema import get_agents_md
 from openkb.review import ReviewItem, parse_review_blocks, ReviewQueue
@@ -156,6 +158,12 @@ Return ONLY the Markdown content (no frontmatter, no code fences).
 """
 
 
+_CONCEPTS_ONLY_DOC_CONTEXT_USER = """\
+Regenerate concept pages and index links for document "{doc_name}".
+Use only the summary provided in the assistant message as the source of truth.
+"""
+
+
 # ---------------------------------------------------------------------------
 # LLM helpers
 # ---------------------------------------------------------------------------
@@ -177,7 +185,7 @@ def _fmt_messages(messages: list[dict], max_content: int = 200) -> str:
 
 def _llm_call(model: str, messages: list[dict], step_name: str, **kwargs) -> str:
     """Single LLM call via subprocess executor."""
-    from openkb.executor import ExecutorConfig, run_llm_with_system
+    from openkb.executor import ExecutorConfig, build_executor_config, run_llm_with_system
     logger.debug("LLM request [%s]:\n%s", step_name, _fmt_messages(messages))
 
     # Build system and user prompts from messages list
@@ -192,11 +200,10 @@ def _llm_call(model: str, messages: list[dict], step_name: str, **kwargs) -> str
     system_prompt = "\n".join(system_parts)
     user_prompt = "\n".join(user_parts)
 
-    # Determine provider from model prefix (e.g. "anthropic/claude-sonnet-4-6" → "claude")
-    cfg = kwargs.pop("executor_config", None) or ExecutorConfig()
-    # If model starts with "anthropic/" or is a short alias like "sonnet", use claude provider
-    if model and not model.startswith("anthropic/"):
-        cfg.model = model
+    # Determine provider from model name when no explicit config given
+    cfg = kwargs.pop("executor_config", None)
+    if cfg is None:
+        cfg = build_executor_config(model=model)
 
     result = run_llm_with_system(system_prompt, user_prompt, cfg)
 
@@ -350,6 +357,8 @@ def _read_concept_briefs(wiki_dir: Path) -> str:
                     elif line.startswith("entity_type:"):
                         entity_type = line[len("entity_type:"):].strip()
         if not brief:
+            brief = _embedded_json_brief(body)
+        if not brief:
             brief = body.strip().replace("\n", " ")[:150]
         if brief:
             type_tag = f" [{entity_type}]" if entity_type else ""
@@ -409,52 +418,146 @@ def _insert_section_entry(lines: list[str], heading: str, entry: str) -> bool:
     return True
 
 
+def _utcnow_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _as_string_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value if str(item).strip()]
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _summary_source_path(doc_name: str, doc_type: str) -> str:
+    ext = "md" if doc_type == "short" else "json"
+    return f"sources/{doc_name}.{ext}"
+
+
+def _summary_page_path(doc_name: str) -> str:
+    return f"summaries/{doc_name}.md"
+
+
+def _build_provenance_meta(
+    *,
+    generation_mode: str,
+    supporting_sources: list[str],
+    supporting_pages: list[str],
+    previous_meta: dict | None = None,
+) -> dict:
+    previous_meta = previous_meta or {}
+    legacy_sources = _as_string_list(previous_meta.get("sources"))
+    prior_supporting_sources = _as_string_list(previous_meta.get("supporting_sources"))
+    prior_supporting_pages = _as_string_list(previous_meta.get("supporting_pages"))
+
+    merged_sources = _dedupe_strings(
+        prior_supporting_sources
+        + [source for source in legacy_sources if not source.startswith("summaries/")]
+        + supporting_sources
+    )
+    merged_pages = _dedupe_strings(
+        prior_supporting_pages
+        + [source for source in legacy_sources if source.startswith("summaries/")]
+        + supporting_pages
+    )
+
+    return {
+        "updated_at": _utcnow_iso(),
+        "source_count": len(merged_sources),
+        "supporting_sources": merged_sources,
+        "supporting_pages": merged_pages,
+        "generation_mode": generation_mode,
+    }
+
 
 def _write_summary(wiki_dir: Path, doc_name: str, summary: str,
-                    doc_type: str = "short") -> None:
+                    doc_type: str = "short", entities: list | None = None) -> None:
     """Write summary page with frontmatter."""
-    if summary.startswith("---"):
-        end = summary.find("---", 3)
-        if end != -1:
-            summary = summary[end + 3:].lstrip("\n")
+    clean_summary = parse_fm(summary)[1] if summary.startswith("---") else summary
     summaries_dir = wiki_dir / "summaries"
     summaries_dir.mkdir(parents=True, exist_ok=True)
-    ext = "md" if doc_type == "short" else "json"
-    fm_lines = [
-        f"doc_type: {doc_type}",
-        f"full_text: sources/{doc_name}.{ext}",
-    ]
-    frontmatter = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
-    (summaries_dir / f"{doc_name}.md").write_text(frontmatter + summary, encoding="utf-8")
+    full_text_path = _summary_source_path(doc_name, doc_type)
+    summary_path = _summary_page_path(doc_name)
+    meta = {
+        "doc_type": doc_type,
+        "full_text": full_text_path,
+    }
+    meta.update(
+        _build_provenance_meta(
+            generation_mode="summary_write",
+            supporting_sources=[full_text_path],
+            supporting_pages=[summary_path],
+        )
+    )
+    if entities:
+        meta["entities"] = entities
+    path = summaries_dir / f"{doc_name}.md"
+    path.write_text(serialize_fm(meta, clean_summary), encoding="utf-8")
+
+
+def _summary_brief_from_body(body: str) -> str:
+    """Extract a short one-line brief from an existing summary body."""
+    text = body.strip()
+    if not text:
+        return ""
+
+    m = re.search(r"^## (?:한줄 요약|Summary)\s*\n+(.+?)(?:\n## |\Z)", text, re.MULTILINE | re.DOTALL)
+    if m:
+        brief = m.group(1).strip()
+    else:
+        brief = ""
+        for block in re.split(r"\n\s*\n", text):
+            line = block.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("- "):
+                line = line[2:].strip()
+            brief = line
+            break
+
+    brief = re.sub(r"\[\[([^\]]+)\]\]", r"\1", brief)
+    brief = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", brief)
+    brief = re.sub(r"`([^`]+)`", r"\1", brief)
+    brief = re.sub(r"\s+", " ", brief).strip()
+    return brief[:100]
+
+
+def _embedded_json_brief(body: str) -> str:
+    """Extract a brief from legacy JSON-shaped concept content if present."""
+    text = body.lstrip()
+    if not text.startswith("{"):
+        return ""
+
+    for key in ("concept_page", "concept", "summary_page", "summary"):
+        m = re.search(rf'"{key}"\s*:\s*\{{.*?"brief"\s*:\s*"([^"]+)"', text, re.DOTALL)
+        if m:
+            brief = re.sub(r"\s+", " ", m.group(1)).strip()
+            return brief[:100]
+    return ""
+
+
+def _load_existing_summary(wiki_dir: Path, doc_name: str) -> tuple[dict, str, str]:
+    """Load summary metadata/body/brief for concept-only regeneration."""
+    path = wiki_dir / "summaries" / f"{doc_name}.md"
+    if not path.exists():
+        raise FileNotFoundError(f"Existing summary not found: {path}")
+    meta, body = parse_fm(path.read_text(encoding="utf-8"))
+    return meta, body, _summary_brief_from_body(body)
 
 
 _SAFE_NAME_RE = re.compile(r'[^\w\-]')
-
-
-def _split_frontmatter(text: str) -> tuple[str, str]:
-    """Split text into (frontmatter_block, body). Returns ('', text) if no FM."""
-    if text.startswith("---"):
-        end = text.find("---", 3)
-        if end != -1:
-            return text[:end + 3], text[end + 3:]
-    return "", text
-
-
-def _inject_fm_field(frontmatter: str, field: str, value: str) -> str:
-    """Insert or replace a YAML field in a frontmatter block."""
-    pattern = f"{field}:"
-    if pattern in frontmatter:
-        return re.sub(rf"{re.escape(field)}:.*", f"{field}: {value}", frontmatter)
-    return frontmatter.replace("---\n", f"---\n{field}: {value}\n", 1)
-
-
-def _strip_frontmatter(text: str) -> str:
-    """Remove leading frontmatter block from text."""
-    if text.startswith("---"):
-        end = text.find("---", 3)
-        if end != -1:
-            return text[end + 3:].lstrip("\n")
-    return text
 
 
 def _sanitize_concept_name(name: str) -> str:
@@ -517,7 +620,17 @@ def _analyze_document(
     }
 
 
-def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is_update: bool, brief: str = "", entity_type: str = "") -> None:
+def _write_concept(
+    wiki_dir: Path,
+    name: str,
+    content: str,
+    source_file: str,
+    is_update: bool,
+    brief: str = "",
+    entity_type: str = "",
+    supporting_source: str | None = None,
+    supporting_page: str | None = None,
+) -> None:
     """Write or update a concept page, managing the sources frontmatter."""
     concepts_dir = wiki_dir / "concepts"
     concepts_dir.mkdir(parents=True, exist_ok=True)
@@ -527,41 +640,40 @@ def _write_concept(wiki_dir: Path, name: str, content: str, source_file: str, is
         logger.warning("Concept name escapes concepts dir: %s", name)
         return
 
+    clean_body = parse_fm(content)[1] if content.startswith("---") else content
+    generation_mode = "concept_update" if is_update else "concept_create"
+
     if is_update and path.exists():
         existing = path.read_text(encoding="utf-8")
-        if source_file not in existing:
-            fm, body = _split_frontmatter(existing)
-            if fm:
-                if "sources:" in fm:
-                    fm = fm.replace("sources: [", f"sources: [{source_file}, ")
-                else:
-                    fm = _inject_fm_field(fm, "sources", f"[{source_file}]")
-                existing = fm + body
-            else:
-                existing = f"---\nsources: [{source_file}]\n---\n\n" + existing
-        clean = _strip_frontmatter(content)
-        fm, body = _split_frontmatter(existing)
-        existing = (fm + "\n\n" + clean) if fm else clean
-        if brief and fm:
-            fm, body = _split_frontmatter(existing)
-            if fm:
-                fm = _inject_fm_field(fm, "brief", brief)
-                existing = fm + body
-        if entity_type and fm:
-            fm, body = _split_frontmatter(existing)
-            if fm:
-                fm = _inject_fm_field(fm, "entity_type", entity_type)
-                existing = fm + body
-        path.write_text(existing, encoding="utf-8")
-    else:
-        clean = _strip_frontmatter(content)
-        fm_lines = [f"sources: [{source_file}]"]
+        meta, _ = parse_fm(existing)
+        meta["sources"] = _dedupe_strings(_as_string_list(meta.get("sources")) + [source_file])
+        meta.update(
+            _build_provenance_meta(
+                generation_mode=generation_mode,
+                supporting_sources=[supporting_source or source_file],
+                supporting_pages=[supporting_page or source_file],
+                previous_meta=meta,
+            )
+        )
         if brief:
-            fm_lines.append(f"brief: {brief}")
+            meta["brief"] = brief
         if entity_type:
-            fm_lines.append(f"entity_type: {entity_type}")
-        frontmatter = "---\n" + "\n".join(fm_lines) + "\n---\n\n"
-        path.write_text(frontmatter + clean, encoding="utf-8")
+            meta["entity_type"] = entity_type
+        path.write_text(serialize_fm(meta, clean_body), encoding="utf-8")
+    else:
+        meta = {"sources": [source_file]}
+        meta.update(
+            _build_provenance_meta(
+                generation_mode=generation_mode,
+                supporting_sources=[supporting_source or source_file],
+                supporting_pages=[supporting_page or source_file],
+            )
+        )
+        if brief:
+            meta["brief"] = brief
+        if entity_type:
+            meta["entity_type"] = entity_type
+        path.write_text(serialize_fm(meta, clean_body), encoding="utf-8")
 
 
 def _add_related_link(wiki_dir: Path, concept_slug: str, doc_name: str, source_file: str) -> None:
@@ -576,23 +688,20 @@ def _add_related_link(wiki_dir: Path, concept_slug: str, doc_name: str, source_f
     if link in text:
         return
 
-    # Update sources in frontmatter
-    if source_file not in text:
-        if text.startswith("---"):
-            end = text.find("---", 3)
-            if end != -1:
-                fm = text[:end + 3]
-                body = text[end + 3:]
-                if "sources:" in fm:
-                    fm = fm.replace("sources: [", f"sources: [{source_file}, ")
-                else:
-                    fm = fm.replace("---\n", f"---\nsources: [{source_file}]\n", 1)
-                text = fm + body
-        else:
-            text = f"---\nsources: [{source_file}]\n---\n\n" + text
+    meta, body = parse_fm(text)
+    sources = meta.get("sources", [])
+    if isinstance(sources, str):
+        sources = [sources]
+    if source_file not in sources:
+        sources.append(source_file)
+    meta["sources"] = sources
 
-    text += f"\n\nSee also: {link}"
-    path.write_text(text, encoding="utf-8")
+    if "## Related Documents" in body:
+        updated = body.replace("## Related Documents", f"## Related Documents\n- {link}")
+    else:
+        updated = body.rstrip() + f"\n\n## Related Documents\n- {link}\n"
+
+    path.write_text(serialize_fm(meta, updated), encoding="utf-8")
 
 
 def _backlink_summary(wiki_dir: Path, doc_name: str, concept_slugs: list[str]) -> None:
@@ -642,11 +751,12 @@ def _backlink_concepts(wiki_dir: Path, doc_name: str, concept_slugs: list[str]) 
         text = path.read_text(encoding="utf-8")
         if link in text:
             continue
-        if "## Related Documents" in text:
-            text = text.replace("## Related Documents\n", f"## Related Documents\n- {link}\n", 1)
+        meta, body = parse_fm(text)
+        if "## Related Documents" in body:
+            updated = body.replace("## Related Documents\n", f"## Related Documents\n- {link}\n", 1)
         else:
-            text += f"\n\n## Related Documents\n- {link}\n"
-        path.write_text(text, encoding="utf-8")
+            updated = body.rstrip() + f"\n\n## Related Documents\n- {link}\n"
+        path.write_text(serialize_fm(meta, updated), encoding="utf-8")
 
 
 # Language-specific section headers for index.md
@@ -750,7 +860,8 @@ async def _compile_concepts(
     If *analysis_context* is provided, concept_actions from the analysis
     step are injected as prior context into the concept plan prompt.
     """
-    source_file = f"summaries/{doc_name}.md"
+    source_file = _summary_page_path(doc_name)
+    supporting_source = _summary_source_path(doc_name, doc_type)
 
     # --- Step 2: Get concepts plan (A cached) ---
     concept_briefs = _read_concept_briefs(wiki_dir)
@@ -817,6 +928,8 @@ async def _compile_concepts(
             ], f"concept: {name}")
         try:
             parsed = _parse_json(raw)
+            if not isinstance(parsed, dict):
+                raise ValueError("concept response was not a JSON object")
             brief = parsed.get("brief", "")
             entity_type = parsed.get("entity_type", "") or entity_type
             content = _clean_concept_content(parsed.get("content", raw))
@@ -850,6 +963,8 @@ async def _compile_concepts(
             ], f"update: {name}")
         try:
             parsed = _parse_json(raw)
+            if not isinstance(parsed, dict):
+                raise ValueError("concept response was not a JSON object")
             brief = parsed.get("brief", "")
             entity_type = parsed.get("entity_type", "") or entity_type
             content = _clean_concept_content(parsed.get("content", raw))
@@ -877,7 +992,9 @@ async def _compile_concepts(
                 continue
             name, page_content, is_update, brief, entity_type = r
             _write_concept(wiki_dir, name, page_content, source_file, is_update,
-                          brief=brief, entity_type=entity_type)
+                          brief=brief, entity_type=entity_type,
+                          supporting_source=supporting_source,
+                          supporting_page=source_file)
             safe_name = _sanitize_concept_name(name)
             concept_names.append(safe_name)
             if brief:
@@ -906,6 +1023,13 @@ async def _compile_concepts(
     except Exception as exc:
         logger.warning("Graph rebuild failed (non-fatal): %s", exc)
 
+    # --- Step 6: Internal maintenance (non-blocking) ---
+    try:
+        from openkb.maintenance import run_internal_maintenance
+        run_internal_maintenance(kb_dir)
+    except Exception as exc:
+        logger.warning("Internal maintenance failed (non-fatal): %s", exc)
+
 
 async def compile_short_doc(
     doc_name: str,
@@ -927,42 +1051,59 @@ async def compile_short_doc(
 
     wiki_dir = kb_dir / "wiki"
     schema_md = get_agents_md(wiki_dir)
-    content = source_path.read_text(encoding="utf-8")
+    summary_only = os.environ.get("OPENKB_SUMMARY_ONLY") == "1"
+    concepts_only = os.environ.get("OPENKB_CONCEPTS_ONLY") == "1"
 
     # Base context A: system + document
     system_msg = {"role": "system", "content": _SYSTEM_TEMPLATE.format(
         schema_md=schema_md, language=language,
     )}
-    doc_msg = {"role": "user", "content": _SUMMARY_USER.format(
-        doc_name=doc_name, content=content,
-    )}
 
-    # --- Step 0: Analysis step ---
-    concept_briefs = _read_concept_briefs(wiki_dir)
-    analysis = _analyze_document(
-        model=model,
-        system_msg=system_msg,
-        doc_msg=doc_msg,
-        concept_briefs=concept_briefs,
-    )
+    analysis: dict = {}
+    if concepts_only:
+        _, summary, doc_brief = _load_existing_summary(wiki_dir, doc_name)
+        doc_msg = {"role": "user", "content": _CONCEPTS_ONLY_DOC_CONTEXT_USER.format(
+            doc_name=doc_name,
+        )}
+    else:
+        content = source_path.read_text(encoding="utf-8")
+        doc_msg = {"role": "user", "content": _SUMMARY_USER.format(
+            doc_name=doc_name, content=content,
+        )}
 
-    # Save review items to queue
-    review_items = analysis.get("review_items", [])
-    if review_items:
-        openkb_dir = kb_dir / ".openkb"
-        queue = ReviewQueue(openkb_dir)
-        queue.add(review_items)
+        if not summary_only:
+            # --- Step 0: Analysis step ---
+            concept_briefs = _read_concept_briefs(wiki_dir)
+            analysis = _analyze_document(
+                model=model,
+                system_msg=system_msg,
+                doc_msg=doc_msg,
+                concept_briefs=concept_briefs,
+            )
 
-    # --- Step 1: Generate summary ---
-    summary_raw = _llm_call(model, [system_msg, doc_msg], "summary")
-    try:
-        summary_parsed = _parse_json(summary_raw)
-        doc_brief = summary_parsed.get("brief", "")
-        summary = _clean_concept_content(summary_parsed.get("content", summary_raw))
-    except (json.JSONDecodeError, ValueError):
-        doc_brief = ""
-        summary = _clean_concept_content(summary_raw)
-    _write_summary(wiki_dir, doc_name, summary)
+            # Save review items to queue
+            review_items = analysis.get("review_items", [])
+            if review_items:
+                openkb_dir = kb_dir / ".openkb"
+                queue = ReviewQueue(openkb_dir)
+                queue.add(review_items)
+
+        # --- Step 1: Generate summary ---
+        summary_raw = _llm_call(model, [system_msg, doc_msg], "summary")
+        try:
+            summary_parsed = _parse_json(summary_raw)
+            if isinstance(summary_parsed, dict):
+                doc_brief = summary_parsed.get("brief", "")
+                summary = _clean_concept_content(summary_parsed.get("content", summary_raw))
+            else:
+                raise ValueError("summary response was not a JSON object")
+        except (json.JSONDecodeError, ValueError):
+            doc_brief = ""
+            summary = _clean_concept_content(summary_raw)
+        _write_summary(wiki_dir, doc_name, summary, entities=analysis.get("entities", []))
+
+    if summary_only:
+        return
 
     # --- Steps 2-4: Concept plan → generate/update → index ---
     await _compile_concepts(
@@ -996,33 +1137,49 @@ async def compile_long_doc(
     wiki_dir = kb_dir / "wiki"
     schema_md = get_agents_md(wiki_dir)
     summary_content = summary_path.read_text(encoding="utf-8")
+    summary_only = os.environ.get("OPENKB_SUMMARY_ONLY") == "1"
+    concepts_only = os.environ.get("OPENKB_CONCEPTS_ONLY") == "1"
 
     # Base context A
     system_msg = {"role": "system", "content": _SYSTEM_TEMPLATE.format(
         schema_md=schema_md, language=language,
     )}
-    doc_msg = {"role": "user", "content": _LONG_DOC_SUMMARY_USER.format(
-        doc_name=doc_name, doc_id=doc_id, content=summary_content,
-    )}
 
-    # --- Step 0: Analysis step ---
-    concept_briefs = _read_concept_briefs(wiki_dir)
-    analysis = _analyze_document(
-        model=model,
-        system_msg=system_msg,
-        doc_msg=doc_msg,
-        concept_briefs=concept_briefs,
-    )
+    analysis: dict = {}
+    if concepts_only:
+        _, overview = parse_fm(summary_content)
+        doc_msg = {"role": "user", "content": _CONCEPTS_ONLY_DOC_CONTEXT_USER.format(
+            doc_name=doc_name,
+        )}
+        if not doc_description:
+            doc_description = _summary_brief_from_body(overview)
+    else:
+        doc_msg = {"role": "user", "content": _LONG_DOC_SUMMARY_USER.format(
+            doc_name=doc_name, doc_id=doc_id, content=summary_content,
+        )}
 
-    # Save review items to queue
-    review_items = analysis.get("review_items", [])
-    if review_items:
-        openkb_dir = kb_dir / ".openkb"
-        queue = ReviewQueue(openkb_dir)
-        queue.add(review_items)
+        if not summary_only:
+            # --- Step 0: Analysis step ---
+            concept_briefs = _read_concept_briefs(wiki_dir)
+            analysis = _analyze_document(
+                model=model,
+                system_msg=system_msg,
+                doc_msg=doc_msg,
+                concept_briefs=concept_briefs,
+            )
 
-    # --- Step 1: Generate overview ---
-    overview = _llm_call(model, [system_msg, doc_msg], "overview")
+            # Save review items to queue
+            review_items = analysis.get("review_items", [])
+            if review_items:
+                openkb_dir = kb_dir / ".openkb"
+                queue = ReviewQueue(openkb_dir)
+                queue.add(review_items)
+
+        # --- Step 1: Generate overview ---
+        overview = _llm_call(model, [system_msg, doc_msg], "overview")
+
+    if summary_only:
+        return
 
     # --- Steps 2-4: Concept plan → generate/update → index ---
     await _compile_concepts(

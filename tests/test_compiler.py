@@ -121,7 +121,22 @@ class TestWriteSummary:
         text = path.read_text()
         assert "doc_type: short" in text
         assert "full_text: sources/my-doc.md" in text
-        assert "# Summary" in text
+
+    def test_writes_provenance_contract_fields(self, tmp_path):
+        from openkb.frontmatter import parse_fm
+
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+
+        _write_summary(wiki, "my-doc", "# Summary\n\nContent here.")
+
+        meta, body = parse_fm((wiki / "summaries" / "my-doc.md").read_text(encoding="utf-8"))
+        assert meta["updated_at"]
+        assert meta["source_count"] == 1
+        assert meta["supporting_sources"] == ["sources/my-doc.md"]
+        assert meta["supporting_pages"] == ["summaries/my-doc.md"]
+        assert meta["generation_mode"] == "summary_write"
+        assert body.startswith("# Summary")
 
     def test_writes_without_brief(self, tmp_path):
         wiki = tmp_path / "wiki"
@@ -133,6 +148,26 @@ class TestWriteSummary:
         assert "full_text: sources/my-doc.md" in text
 
 
+class TestWriteSummaryWithEntities:
+    def test_writes_entities_to_frontmatter(self, tmp_path):
+        from openkb.agent.compiler import _write_summary
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        entities = [{"name": "OpenAI", "type": "organization"}]
+        _write_summary(wiki, "my-doc", "# Summary\n\nContent.", entities=entities)
+        text = (wiki / "summaries" / "my-doc.md").read_text()
+        assert "OpenAI" in text
+        assert "organization" in text
+
+    def test_write_summary_without_entities(self, tmp_path):
+        from openkb.agent.compiler import _write_summary
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        _write_summary(wiki, "my-doc", "# Summary\n\nContent.")
+        text = (wiki / "summaries" / "my-doc.md").read_text()
+        assert "entities:" not in text
+
+
 class TestWriteConcept:
     def test_new_concept_with_brief(self, tmp_path):
         wiki = tmp_path / "wiki"
@@ -141,7 +176,7 @@ class TestWriteConcept:
         path = wiki / "concepts" / "attention.md"
         assert path.exists()
         text = path.read_text()
-        assert "sources: [paper.pdf]" in text
+        assert "paper.pdf" in text
         assert "brief: Mechanism for selective focus" in text
         assert "# Attention" in text
 
@@ -152,8 +187,33 @@ class TestWriteConcept:
         path = wiki / "concepts" / "attention.md"
         assert path.exists()
         text = path.read_text()
-        assert "sources: [paper.pdf]" in text
+        assert "paper.pdf" in text
         assert "brief:" not in text
+
+    def test_new_concept_records_provenance_contract_fields(self, tmp_path):
+        from openkb.frontmatter import parse_fm
+
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+
+        _write_concept(
+            wiki,
+            "attention",
+            "# Attention\n\nDetails.",
+            "summaries/paper.md",
+            False,
+            supporting_source="sources/paper.md",
+            supporting_page="summaries/paper.md",
+        )
+
+        meta, body = parse_fm((wiki / "concepts" / "attention.md").read_text(encoding="utf-8"))
+        assert meta["updated_at"]
+        assert meta["source_count"] == 1
+        assert meta["sources"] == ["summaries/paper.md"]
+        assert meta["supporting_sources"] == ["sources/paper.md"]
+        assert meta["supporting_pages"] == ["summaries/paper.md"]
+        assert meta["generation_mode"] == "concept_create"
+        assert body.startswith("# Attention")
 
     def test_update_concept_updates_brief(self, tmp_path):
         wiki = tmp_path / "wiki"
@@ -183,6 +243,49 @@ class TestWriteConcept:
         assert "paper2.pdf" in text
         assert "paper1.pdf" in text
         assert "New info from paper2." in text
+
+    def test_update_concept_accumulates_provenance_contract_fields(self, tmp_path):
+        from openkb.frontmatter import parse_fm
+
+        wiki = tmp_path / "wiki"
+        concepts = wiki / "concepts"
+        concepts.mkdir(parents=True)
+        (concepts / "attention.md").write_text(
+            (
+                "---\n"
+                "sources:\n"
+                "- summaries/paper-1.md\n"
+                "updated_at: 2026-04-18T00:00:00Z\n"
+                "source_count: 1\n"
+                "supporting_sources:\n"
+                "- sources/paper-1.md\n"
+                "supporting_pages:\n"
+                "- summaries/paper-1.md\n"
+                "generation_mode: concept_create\n"
+                "---\n\n"
+                "# Attention\n\nOld content."
+            ),
+            encoding="utf-8",
+        )
+
+        _write_concept(
+            wiki,
+            "attention",
+            "New info from paper 2.",
+            "summaries/paper-2.md",
+            True,
+            supporting_source="sources/paper-2.md",
+            supporting_page="summaries/paper-2.md",
+        )
+
+        meta, body = parse_fm((concepts / "attention.md").read_text(encoding="utf-8"))
+        assert meta["sources"] == ["summaries/paper-1.md", "summaries/paper-2.md"]
+        assert meta["supporting_sources"] == ["sources/paper-1.md", "sources/paper-2.md"]
+        assert meta["supporting_pages"] == ["summaries/paper-1.md", "summaries/paper-2.md"]
+        assert meta["source_count"] == 2
+        assert meta["generation_mode"] == "concept_update"
+        assert meta["updated_at"] != "2026-04-18T00:00:00Z"
+        assert body == "New info from paper 2."
 
 
 class TestUpdateIndex:
@@ -398,6 +501,23 @@ class TestReadConceptBriefs:
         result = _read_concept_briefs(wiki)
         assert "- old: Old concept without brief field." in result
 
+    def test_reads_brief_from_legacy_json_body(self, tmp_path):
+        wiki = tmp_path / "wiki"
+        concepts = wiki / "concepts"
+        concepts.mkdir(parents=True)
+        (concepts / "legacy.md").write_text(
+            "---\nentity_type: concept\nsources: [paper.pdf]\n---\n\n"
+            '{\n'
+            '  "concept_page": {\n'
+            '    "brief": "Legacy JSON brief",\n'
+            '    "content": "# Legacy\\n\\nBody."\n'
+            '  }\n'
+            '}\n',
+            encoding="utf-8",
+        )
+        result = _read_concept_briefs(wiki)
+        assert "- legacy [concept]: Legacy JSON brief" in result
+
 
 class TestBacklinkSummary:
     def test_adds_missing_concept_links(self, tmp_path):
@@ -589,7 +709,7 @@ class TestCompileShortDoc:
         # Verify concept written
         concept_path = wiki / "concepts" / "transformer.md"
         assert concept_path.exists()
-        assert "sources: [summaries/test-doc.md]" in concept_path.read_text()
+        assert "summaries/test-doc.md" in concept_path.read_text()
 
         # Verify index updated
         index_text = (wiki / "index.md").read_text()
@@ -664,6 +784,58 @@ class TestCompileLongDoc:
         assert "[[summaries/big-doc]]" in index_text
         assert "[[concepts/deep-learning]]" in index_text
 
+    @pytest.mark.asyncio
+    async def test_concepts_only_uses_existing_summary_context(self, tmp_path, monkeypatch):
+        wiki = tmp_path / "wiki"
+        (wiki / "summaries").mkdir(parents=True)
+        (wiki / "concepts").mkdir(parents=True)
+        (wiki / "index.md").write_text(
+            "# Index\n\n## Documents\n\n## Concepts\n",
+            encoding="utf-8",
+        )
+        summary_path = wiki / "summaries" / "big-doc.md"
+        summary_path.write_text(
+            "---\n"
+            "doc_type: pageindex\n"
+            "---\n\n"
+            "# Big Doc\n\n"
+            "## 한줄 요약\n"
+            "저장된 개요.\n\n"
+            "기존 pageindex 본문.\n",
+            encoding="utf-8",
+        )
+        openkb_dir = tmp_path / ".openkb"
+        openkb_dir.mkdir()
+        (openkb_dir / "config.yaml").write_text("model: gpt-4o-mini\n")
+
+        concepts_list_response = json.dumps({
+            "create": [{"name": "deep-learning", "title": "Deep Learning"}],
+            "update": [],
+            "related": [],
+        })
+        concept_page_response = json.dumps({
+            "brief": "Subfield of ML using neural networks",
+            "content": "# Deep Learning\n\nA subfield of ML.",
+        })
+
+        monkeypatch.setenv("OPENKB_CONCEPTS_ONLY", "1")
+        try:
+            with patch("openkb.agent.compiler._llm_call") as mock_llm:
+                mock_llm.side_effect = [concepts_list_response, concept_page_response]
+                await compile_long_doc(
+                    "big-doc", summary_path, "doc-123", tmp_path, "gpt-4o-mini"
+                )
+
+            call_names = [call.kwargs.get("step_name", call.args[2] if len(call.args) > 2 else None) for call in mock_llm.call_args_list]
+            assert "analysis" not in call_names
+            assert "overview" not in call_names
+            first_messages = mock_llm.call_args_list[0].args[1]
+            assert "big-doc" in first_messages[1]["content"]
+            assert "기존 pageindex 본문." in first_messages[2]["content"]
+            assert (wiki / "concepts" / "deep-learning.md").exists()
+        finally:
+            monkeypatch.delenv("OPENKB_CONCEPTS_ONLY", raising=False)
+
 
 class TestCompileConceptsPlan:
     """Integration tests for _compile_concepts with the new plan format."""
@@ -732,7 +904,7 @@ class TestCompileConceptsPlan:
         fa_path = wiki / "concepts" / "flash-attention.md"
         assert fa_path.exists()
         fa_text = fa_path.read_text()
-        assert "sources: [summaries/test-doc.md]" in fa_text
+        assert "summaries/test-doc.md" in fa_text
         assert "Flash Attention" in fa_text
 
         # Verify attention updated (is_update=True path in _write_concept)
@@ -806,7 +978,7 @@ class TestCompileConceptsPlan:
         att_path = wiki / "concepts" / "attention.md"
         assert att_path.exists()
         att_text = att_path.read_text()
-        assert "sources: [summaries/test-doc.md]" in att_text
+        assert "summaries/test-doc.md" in att_text
         assert "Attention" in att_text
 
 
@@ -1026,7 +1198,7 @@ class TestBriefIntegration:
         analysis_resp = json.dumps({
             "entities": [], "concept_actions": [], "review_items": [],
         })
-        with patch("openkb.agent.compiler._llm_call") as mock_llm:
+        with patch("openkb.agent.compiler._llm_call") as mock_llm, patch("openkb.maintenance.run_internal_maintenance"):
             mock_llm.side_effect = [analysis_resp, summary_resp, plan_resp, concept_resp]
             await compile_short_doc("test-doc", source_path, tmp_path, "gpt-4o-mini")
 
@@ -1402,3 +1574,119 @@ class TestCompileConceptsGraphRebuild:
                 summary, "test-doc", 5,
             )
             mock_graph.assert_called_once_with(wiki, tmp_path / ".openkb")
+
+    @pytest.mark.asyncio
+    async def test_concept_response_list_falls_back_to_raw_content(self, tmp_path):
+        wiki = tmp_path / "wiki"
+        (wiki / "summaries").mkdir(parents=True)
+        (wiki / "concepts").mkdir(parents=True)
+        (wiki / "index.md").write_text(
+            "# Index\n\n## Documents\n\n## Concepts\n",
+            encoding="utf-8",
+        )
+        (tmp_path / "raw").mkdir(exist_ok=True)
+        (tmp_path / "raw" / "test-doc.pdf").write_bytes(b"fake")
+
+        plan_response = json.dumps({
+            "create": [{"name": "alpha", "title": "Alpha"}],
+            "update": [],
+            "related": [],
+        })
+        concept_response = json.dumps(["unexpected concept payload"])
+
+        system_msg = {"role": "system", "content": "You are a wiki agent."}
+        doc_msg = {"role": "user", "content": "Document content."}
+        summary = "Summary."
+
+        with patch("openkb.agent.compiler._llm_call") as mock_llm, \
+             patch("openkb.graph.build.build_and_save_graph"):
+            mock_llm.side_effect = [plan_response, concept_response]
+            await _compile_concepts(
+                wiki, tmp_path, "gpt-4o-mini", system_msg, doc_msg,
+                summary, "test-doc", 5,
+            )
+
+        concept_text = (wiki / "concepts" / "alpha.md").read_text(encoding="utf-8")
+        assert "unexpected concept payload" in concept_text
+
+
+class TestCompileShortDocModes:
+    @pytest.mark.asyncio
+    async def test_compile_short_doc_summary_list_falls_back_to_raw_summary(self, tmp_path):
+        wiki = tmp_path / "wiki"
+        (wiki / "sources").mkdir(parents=True)
+        (wiki / "summaries").mkdir(parents=True)
+        (wiki / "concepts").mkdir(parents=True)
+        (wiki / "index.md").write_text(
+            "# Index\n\n## Documents\n\n## Concepts\n\n## Explorations\n",
+            encoding="utf-8",
+        )
+        source_path = wiki / "sources" / "test-doc.md"
+        source_path.write_text("# Test Doc\n\nSome content.", encoding="utf-8")
+        (tmp_path / ".openkb").mkdir()
+
+        analysis_response = json.dumps({"entities": [], "concept_actions": [], "review_items": []})
+        summary_response = json.dumps([{"unexpected": "shape"}])
+        concepts_list_response = json.dumps({"create": [], "update": [], "related": []})
+
+        with patch("openkb.agent.compiler._llm_call") as mock_llm:
+            mock_llm.side_effect = [analysis_response, summary_response, concepts_list_response]
+            await compile_short_doc("test-doc", source_path, tmp_path, "gpt-4o-mini")
+
+        summary_text = (wiki / "summaries" / "test-doc.md").read_text(encoding="utf-8")
+        assert "unexpected" in summary_text
+
+    @pytest.mark.asyncio
+    async def test_compile_short_doc_concepts_only_reuses_existing_summary(self, tmp_path, monkeypatch):
+        wiki = tmp_path / "wiki"
+        (wiki / "sources").mkdir(parents=True)
+        (wiki / "summaries").mkdir(parents=True)
+        (wiki / "concepts").mkdir(parents=True)
+        (wiki / "index.md").write_text(
+            "# Index\n\n## Documents\n\n## Concepts\n\n## Explorations\n",
+            encoding="utf-8",
+        )
+        source_path = wiki / "sources" / "test-doc.md"
+        source_path.write_text("# Test Doc\n\nSome content about transformers.", encoding="utf-8")
+        (tmp_path / ".openkb").mkdir()
+
+        summary_text = (
+            "---\n"
+            "doc_type: short\n"
+            "full_text: sources/test-doc.md\n"
+            "---\n\n"
+            "# Summary\n\n"
+            "## 한줄 요약\n"
+            "저장된 브리프.\n\n"
+            "기존 summary 본문.\n"
+        )
+        (wiki / "summaries" / "test-doc.md").write_text(summary_text, encoding="utf-8")
+
+        concepts_list_response = json.dumps({
+            "create": [{"name": "transformer", "title": "Transformer"}],
+            "update": [],
+            "related": [],
+        })
+        concept_page_response = json.dumps({
+            "brief": "NN architecture using self-attention",
+            "content": "# Transformer\n\nA neural network architecture.",
+        })
+
+        monkeypatch.setenv("OPENKB_CONCEPTS_ONLY", "1")
+        try:
+            with patch("openkb.agent.compiler._llm_call") as mock_llm:
+                mock_llm.side_effect = [concepts_list_response, concept_page_response]
+                await compile_short_doc("test-doc", source_path, tmp_path, "gpt-4o-mini")
+
+            call_names = [call.kwargs.get("step_name", call.args[2] if len(call.args) > 2 else None) for call in mock_llm.call_args_list]
+            assert "analysis" not in call_names
+            assert "summary" not in call_names
+            first_messages = mock_llm.call_args_list[0].args[1]
+            assert "test-doc" in first_messages[1]["content"]
+            assert "기존 summary 본문." in first_messages[2]["content"]
+            assert (wiki / "concepts" / "transformer.md").exists()
+            summary_after = (wiki / "summaries" / "test-doc.md").read_text(encoding="utf-8")
+            assert summary_text.strip() in summary_after
+            assert "[[concepts/transformer]]" in summary_after
+        finally:
+            monkeypatch.delenv("OPENKB_CONCEPTS_ONLY", raising=False)

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -25,6 +27,32 @@ class TestGetPdfPageCount:
         with patch("openkb.converter.pymupdf.open", return_value=fake_doc):
             count = get_pdf_page_count(tmp_path / "fake.pdf")
         assert count == 5
+
+    def test_importing_converter_suppresses_known_pymupdf_swig_warnings(self):
+        result = subprocess.run(
+            [sys.executable, "-W", "default", "-c", "import openkb.converter"],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        assert "SwigPyPacked" not in result.stderr
+        assert "SwigPyObject" not in result.stderr
+        assert "swigvarlink" not in result.stderr
+
+    def test_importing_images_suppresses_known_pymupdf_swig_warnings(self):
+        result = subprocess.run(
+            [sys.executable, "-W", "default", "-c", "import openkb.images"],
+            cwd=Path(__file__).resolve().parents[1],
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.returncode == 0
+        assert "SwigPyPacked" not in result.stderr
+        assert "SwigPyObject" not in result.stderr
+        assert "swigvarlink" not in result.stderr
 
 
 # ---------------------------------------------------------------------------

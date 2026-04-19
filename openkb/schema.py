@@ -2,6 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
+PROVENANCE_FRONTMATTER_FIELDS = (
+    "updated_at",
+    "source_count",
+    "supporting_sources",
+    "supporting_pages",
+    "generation_mode",
+)
+
 AGENTS_MD = """\
 # Wiki Schema
 
@@ -11,6 +19,7 @@ AGENTS_MD = """\
 - summaries/ — One per source document. Summary of key content.
 - concepts/ — Cross-document topic synthesis. Created when a theme spans multiple documents.
 - explorations/ — Saved query results, analyses, and comparisons worth keeping.
+- queries/ — Durable query pages promoted from explorations when an exploration should become a reusable support source.
 - reports/ — Lint health check reports. Auto-generated.
 
 ## Special Files
@@ -21,6 +30,7 @@ AGENTS_MD = """\
 - **Summary Page** (summaries/): Key content of a single source document.
 - **Concept Page** (concepts/): Cross-document topic synthesis with [[wikilinks]].
 - **Exploration Page** (explorations/): Saved query results — analyses, comparisons, syntheses.
+- **Query Page** (queries/): Durable promoted exploration used as a reusable wiki-query reference.
 - **Index Page** (index.md): One-liner summary of every page in the wiki. Auto-maintained.
 
 ## Index Page Format
@@ -38,6 +48,8 @@ Operations: ingest, query, lint
 - Standard Markdown heading hierarchy
 - Keep each page focused on a single topic
 - Do not include YAML frontmatter (---) in generated content; it is managed by code
+- Code-managed summary and concept frontmatter may include provenance fields:
+  updated_at, source_count, supporting_sources, supporting_pages, generation_mode
 """
 
 # Backward compat alias

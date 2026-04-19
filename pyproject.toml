@@ -43,7 +43,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest", "pytest-asyncio"]
-litellm = ["litellm", "openai-agents"]
 
 [project.urls]
 Repository = "https://github.com/VectifyAI/OpenKB"
@@ -55,6 +54,11 @@ openkb = "openkb.cli:cli"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+filterwarnings = [
+  "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",
+  "ignore:builtin type SwigPyObject has no __module__ attribute:DeprecationWarning",
+  "ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["openkb"]

@@ -1,10 +1,11 @@
-"""4-signal relevance scoring for graph nodes.
+"""5-signal relevance scoring for graph nodes.
 
 Signals:
   - direct_link: 3.0 if edge exists between nodes
   - source_overlap: shared source count * 4.0
   - adamic_adar: sum of 1/log(degree(n)) for shared neighbors * 1.5
   - type_affinity: 1.0 if same non-empty entity_type
+  - entity_mention: shared mentioned_entities count * 2.0
 """
 from __future__ import annotations
 
@@ -43,6 +44,12 @@ def relevance_score(graph: nx.Graph, node_a: str, node_b: str) -> float:
     type_b = graph.nodes[node_b].get("entity_type", "")
     if type_a and type_b and type_a == type_b:
         score += 1.0
+
+    # 5. Entity mention overlap
+    entities_a = set(graph.nodes[node_a].get("mentioned_entities", []) or [])
+    entities_b = set(graph.nodes[node_b].get("mentioned_entities", []) or [])
+    shared_entities = len(entities_a & entities_b)
+    score += shared_entities * 2.0
 
     return score
 

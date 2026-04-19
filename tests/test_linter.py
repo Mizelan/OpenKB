@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from openkb.agent.executor_runtime import ExecutorRunResult
 from openkb.agent.linter import build_lint_agent, run_knowledge_lint
 from openkb.schema import SCHEMA_MD
 
@@ -31,7 +32,7 @@ class TestBuildLintAgent:
 
     def test_agent_model(self, tmp_path):
         agent = build_lint_agent(str(tmp_path), "custom-model")
-        assert agent.model == "litellm/custom-model"
+        assert agent.model == "custom-model"
 
     def test_instructions_mention_contradictions(self, tmp_path):
         agent = build_lint_agent(str(tmp_path), "gpt-4o-mini")
@@ -47,11 +48,12 @@ class TestRunKnowledgeLint:
     async def test_returns_final_output(self, tmp_path):
         (tmp_path / "wiki").mkdir()
 
-        mock_result = MagicMock()
-        mock_result.final_output = "## Lint Report\n\nNo issues found."
-
-        with patch("openkb.agent.linter.Runner.run", new_callable=AsyncMock) as mock_run:
-            mock_run.return_value = mock_result
+        with patch("openkb.agent.linter.run_executor_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = ExecutorRunResult(
+                final_output="## Lint Report\n\nNo issues found.",
+                history=[],
+                turns=1,
+            )
             result = await run_knowledge_lint(tmp_path, "gpt-4o-mini")
 
         assert "No issues found" in result
@@ -64,9 +66,9 @@ class TestRunKnowledgeLint:
 
         async def fake_run(agent, message, **kwargs):
             captured["agent"] = agent
-            return MagicMock(final_output="report")
+            return ExecutorRunResult(final_output="report", history=[], turns=1)
 
-        with patch("openkb.agent.linter.Runner.run", side_effect=fake_run):
+        with patch("openkb.agent.linter.run_executor_agent", side_effect=fake_run):
             await run_knowledge_lint(tmp_path, "gpt-4o-mini")
 
         assert captured["agent"].name == "wiki-linter"
@@ -75,11 +77,8 @@ class TestRunKnowledgeLint:
     async def test_handles_empty_final_output(self, tmp_path):
         (tmp_path / "wiki").mkdir()
 
-        mock_result = MagicMock()
-        mock_result.final_output = None
-
-        with patch("openkb.agent.linter.Runner.run", new_callable=AsyncMock) as mock_run:
-            mock_run.return_value = mock_result
+        with patch("openkb.agent.linter.run_executor_agent", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = ExecutorRunResult(final_output="", history=[], turns=1)
             result = await run_knowledge_lint(tmp_path, "gpt-4o-mini")
 
         assert "completed" in result.lower() or result != ""

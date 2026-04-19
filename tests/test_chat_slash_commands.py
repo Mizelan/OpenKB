@@ -9,8 +9,11 @@ import pytest
 
 from prompt_toolkit.styles import Style
 
-from openkb.agent.chat import _handle_slash, _run_add, run_chat
+from openkb.agent.chat import _handle_slash, _run_add, _run_turn, run_chat
+from openkb.frontmatter import parse_fm
+from openkb.review import ReviewQueue
 from openkb.agent.chat_session import ChatSession
+from openkb.agent.executor_runtime import ExecutorRunResult
 
 
 def _setup_kb(tmp_path: Path) -> Path:
@@ -20,6 +23,8 @@ def _setup_kb(tmp_path: Path) -> Path:
     (kb_dir / "wiki" / "sources" / "images").mkdir(parents=True)
     (kb_dir / "wiki" / "summaries").mkdir(parents=True)
     (kb_dir / "wiki" / "concepts").mkdir(parents=True)
+    (kb_dir / "wiki" / "explorations").mkdir(parents=True)
+    (kb_dir / "wiki" / "queries").mkdir(parents=True)
     (kb_dir / "wiki" / "reports").mkdir(parents=True)
     openkb_dir = kb_dir / ".openkb"
     openkb_dir.mkdir()
@@ -216,3 +221,147 @@ async def test_slash_clear(tmp_path):
     with p:
         result = await _handle_slash("/clear", kb_dir, session, _STYLE)
     assert result == "new_session"
+
+
+@pytest.mark.asyncio
+async def test_run_turn_streams_response_and_persists_history(tmp_path, capsys):
+    kb_dir = _setup_kb(tmp_path)
+    session = _make_session(kb_dir)
+
+    async def fake_run(agent, message, **kwargs):
+        kwargs["on_text_delta"]("Hello ")
+        kwargs["on_text_delta"]("chat")
+        return ExecutorRunResult(
+            final_output="Hello chat",
+            history=[
+                {"role": "user", "content": "Hi"},
+                {"role": "assistant", "content": "Hello chat"},
+            ],
+            turns=1,
+        )
+
+    with patch("openkb.agent.executor_runtime.run_executor_agent", side_effect=fake_run):
+        await _run_turn(object(), session, "Hi", _STYLE, use_color=False, raw=True)
+
+    assert capsys.readouterr().out == "\nHello chat\n\n"
+    assert session.assistant_texts == ["Hello chat"]
+
+
+@pytest.mark.asyncio
+async def test_slash_save_writes_transcript_page(tmp_path):
+    kb_dir = _setup_kb(tmp_path)
+    session = _make_session(kb_dir)
+    session.record_turn(
+        "What is an agent loop?",
+        "An agent loop coordinates repeated planning and execution.",
+        [
+            {"role": "user", "content": "What is an agent loop?"},
+            {"role": "assistant", "content": "An agent loop coordinates repeated planning and execution."},
+        ],
+    )
+    p, collected = _collect_fmt()
+
+    with p:
+        result = await _handle_slash("/save loop-notes", kb_dir, session, _STYLE)
+
+    assert result is None
+    assert any("Saved to" in s for s in collected)
+    saved = next((kb_dir / "wiki" / "explorations").glob("loop-notes-*.md"))
+    meta, body = parse_fm(saved.read_text(encoding="utf-8"))
+    assert meta["session"] == session.id
+    assert "What is an agent loop?" in body
+
+
+@pytest.mark.asyncio
+async def test_slash_promote_latest_query_page(tmp_path):
+    kb_dir = _setup_kb(tmp_path)
+    session = _make_session(kb_dir)
+    older = kb_dir / "wiki" / "explorations" / "attention-20260419.md"
+    latest = kb_dir / "wiki" / "explorations" / "sessions" / "attention-20260420.md"
+    older.write_text(
+        (
+            "---\n"
+            'query: "Older attention?"\n'
+            "---\n\n"
+            "# Attention\n\n"
+            "Older answer.\n"
+        ),
+        encoding="utf-8",
+    )
+    latest.parent.mkdir(parents=True, exist_ok=True)
+    latest.write_text(
+        (
+            "---\n"
+            'query: "What is attention?"\n'
+            "---\n\n"
+            "# Attention\n\n"
+            "Saved answer.\n"
+        ),
+        encoding="utf-8",
+    )
+    p, collected = _collect_fmt()
+
+    with p:
+        result = await _handle_slash("/promote latest query_page", kb_dir, session, _STYLE)
+
+    assert result is None
+    assert any("Promoted latest exploration to query page" in s for s in collected)
+    promoted = kb_dir / "wiki" / "queries" / "sessions" / "attention-20260420.md"
+    assert promoted.exists()
+
+
+@pytest.mark.asyncio
+async def test_slash_promote_latest_concept_seed(tmp_path):
+    kb_dir = _setup_kb(tmp_path)
+    session = _make_session(kb_dir)
+    latest = kb_dir / "wiki" / "explorations" / "context-window-20260419.md"
+    latest.write_text("# Context Window\n\nSaved answer.\n", encoding="utf-8")
+    p, collected = _collect_fmt()
+
+    with p:
+        result = await _handle_slash("/promote latest concept_seed", kb_dir, session, _STYLE)
+
+    assert result is None
+    assert any("Queued concept seed from latest exploration" in s for s in collected)
+    items = ReviewQueue(kb_dir / ".openkb").list()
+    assert len(items) == 1
+    assert items[0].payload["path"] == "concepts/context-window-20260419.md"
+
+
+@pytest.mark.asyncio
+async def test_slash_promote_latest_requires_valid_arguments(tmp_path):
+    kb_dir = _setup_kb(tmp_path)
+    session = _make_session(kb_dir)
+    p, collected = _collect_fmt()
+
+    with p:
+        result = await _handle_slash("/promote", kb_dir, session, _STYLE)
+
+    assert result is None
+    assert any("Usage: /promote latest <query_page|concept_seed>" in s for s in collected)
+
+
+@pytest.mark.asyncio
+async def test_slash_promote_latest_rejects_invalid_mode(tmp_path):
+    kb_dir = _setup_kb(tmp_path)
+    session = _make_session(kb_dir)
+    p, collected = _collect_fmt()
+
+    with p:
+        result = await _handle_slash("/promote latest bad_mode", kb_dir, session, _STYLE)
+
+    assert result is None
+    assert any("Mode must be query_page or concept_seed." in s for s in collected)
+
+
+@pytest.mark.asyncio
+async def test_slash_promote_latest_requires_saved_exploration(tmp_path):
+    kb_dir = _setup_kb(tmp_path)
+    session = _make_session(kb_dir)
+    p, collected = _collect_fmt()
+
+    with p:
+        result = await _handle_slash("/promote latest query_page", kb_dir, session, _STYLE)
+
+    assert result is None
+    assert any("Promotion failed: No saved explorations found." in s for s in collected)

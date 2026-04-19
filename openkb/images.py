@@ -5,7 +5,24 @@ import base64
 import logging
 import re
 import shutil
+import warnings
 from pathlib import Path
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"builtin type SwigPyPacked has no __module__ attribute",
+    category=DeprecationWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"builtin type SwigPyObject has no __module__ attribute",
+    category=DeprecationWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"builtin type swigvarlink has no __module__ attribute",
+    category=DeprecationWarning,
+)
 
 import pymupdf
 

@@ -74,3 +74,20 @@ def test_load_session_sanitizes_legacy_image_history(tmp_path):
     assert output_part["type"] == "input_text"
     assert "data:image/png;base64,AAAA" not in output_part["text"]
     assert "sources/images/doc/figure-1.png" in output_part["text"]
+
+
+def test_record_turn_persists_provider_agnostic_history(tmp_path):
+    session = ChatSession.new(tmp_path, "sonnet", "en")
+    history = [
+        {"role": "user", "content": "What is in index?"},
+        {"type": "tool_call", "name": "read_file", "arguments": {"path": "index.md"}},
+        {"type": "tool_result", "name": "read_file", "output": "# Index"},
+        {"role": "assistant", "content": "The index is available."},
+    ]
+
+    session.record_turn("What is in index?", "The index is available.", history)
+
+    saved = json.loads(session.path.read_text(encoding="utf-8"))
+    assert saved["history"][1]["type"] == "tool_call"
+    assert saved["history"][1]["arguments"]["path"] == "index.md"
+    assert saved["history"][2]["type"] == "tool_result"

@@ -66,7 +66,6 @@ class TestLintCommand:
         (kb_dir / ".openkb" / "hashes.json").write_text(json.dumps(hashes))
         runner = CliRunner()
         with patch("openkb.cli._find_kb_dir", return_value=kb_dir), \
-             patch("openkb.cli._setup_llm_key"), \
              patch("openkb.agent.linter.run_knowledge_lint", return_value="No issues."):
             result = runner.invoke(cli, ["lint"])
         assert result.exit_code == 0

@@ -1,6 +1,7 @@
 """Tests for the `add` CLI command (Task 10)."""
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -122,10 +123,10 @@ class TestAddCommand:
         runner = CliRunner()
         with patch("openkb.cli._find_kb_dir", return_value=kb_dir), \
              patch("openkb.cli.convert_document", return_value=mock_result) as mock_conv, \
-             patch("openkb.cli.asyncio.run") as mock_arun:
+             patch("openkb.cli._run_async_entrypoint") as mock_run_async:
             result = runner.invoke(cli, ["add", str(doc)])
             assert "SKIP" in result.output
-            mock_arun.assert_not_called()
+            mock_run_async.assert_not_called()
 
     def test_add_short_doc_runs_compiler(self, tmp_path):
         kb_dir = self._setup_kb(tmp_path)
@@ -143,9 +144,16 @@ class TestAddCommand:
         )
 
         runner = CliRunner()
+        captured_state: dict[str, object] = {}
+
+        def _fake_run_async(coro):
+            captured_state["state_before_close"] = inspect.getcoroutinestate(coro)
+            coro.close()
+
         with patch("openkb.cli._find_kb_dir", return_value=kb_dir), \
              patch("openkb.cli.convert_document", return_value=mock_result), \
-             patch("openkb.cli.asyncio.run") as mock_arun:
+             patch("openkb.cli._run_async_entrypoint", side_effect=_fake_run_async) as mock_run_async:
             result = runner.invoke(cli, ["add", str(doc)])
-            mock_arun.assert_called_once()
+            mock_run_async.assert_called_once()
             assert "OK" in result.output
+            assert captured_state["state_before_close"] == inspect.CORO_CREATED

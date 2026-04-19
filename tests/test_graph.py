@@ -202,10 +202,82 @@ class TestBuildGraph:
         wiki = _make_wiki(tmp_path)
         openkb_dir = tmp_path / ".openkb"
         openkb_dir.mkdir()
-        graph_path = build_and_save_graph(wiki, openkb_dir)
+        graph, graph_path = build_and_save_graph(wiki, openkb_dir)
         assert graph_path.exists()
+        assert graph.number_of_nodes() > 0
         data = json.loads(graph_path.read_text(encoding="utf-8"))
         assert data["metadata"]["node_count"] > 0
+
+
+class TestGraphLoadError:
+    def test_load_graph_raises_on_corrupted_json(self, tmp_path):
+        from openkb.graph.build import load_graph, GraphLoadError
+        bad_path = tmp_path / "graph.json"
+        bad_path.write_text("{invalid json", encoding="utf-8")
+        with pytest.raises(GraphLoadError):
+            load_graph(bad_path)
+
+    def test_load_graph_raises_on_missing_file(self, tmp_path):
+        from openkb.graph.build import load_graph, GraphLoadError
+        with pytest.raises(GraphLoadError):
+            load_graph(tmp_path / "nonexistent.json")
+
+
+class TestBuildAndSaveReturnsTuple:
+    def test_returns_graph_and_path(self, tmp_path):
+        from openkb.graph.build import build_and_save_graph
+        wiki = _make_wiki(tmp_path)
+        openkb_dir = tmp_path / ".openkb"
+        openkb_dir.mkdir()
+        result = build_and_save_graph(wiki, openkb_dir)
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        graph, path = result
+        assert graph.number_of_nodes() > 0
+        assert path.exists()
+
+
+class TestEntityMentionEdges:
+    def test_entity_mention_edges_created(self, tmp_path):
+        """Pages sharing an entity should get entity_mention edges."""
+        from openkb.graph.build import build_graph
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        (wiki / "summaries").mkdir()
+        (wiki / "concepts").mkdir()
+        (wiki / "explorations").mkdir()
+        (wiki / "summaries" / "doc1.md").write_text(
+            "---\ndoc_type: short\nentities:\n- name: OpenAI\n  type: organization\n---\n\nDoc1 content.",
+            encoding="utf-8",
+        )
+        (wiki / "summaries" / "doc2.md").write_text(
+            "---\ndoc_type: short\nentities:\n- name: OpenAI\n  type: organization\n---\n\nDoc2 content.",
+            encoding="utf-8",
+        )
+        g = build_graph(wiki)
+        assert g.has_edge("summaries/doc1", "summaries/doc2")
+        edge_data = g.get_edge_data("summaries/doc1", "summaries/doc2")
+        assert edge_data["edge_type"] == "entity_mention"
+
+    def test_no_entity_mention_without_shared_entities(self, tmp_path):
+        from openkb.graph.build import build_graph
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        (wiki / "summaries").mkdir()
+        (wiki / "concepts").mkdir()
+        (wiki / "explorations").mkdir()
+        (wiki / "summaries" / "doc1.md").write_text(
+            "---\ndoc_type: short\nentities:\n- name: OpenAI\n  type: organization\n---\n\nContent.",
+            encoding="utf-8",
+        )
+        (wiki / "summaries" / "doc2.md").write_text(
+            "---\ndoc_type: short\nentities:\n- name: Google\n  type: organization\n---\n\nContent.",
+            encoding="utf-8",
+        )
+        g = build_graph(wiki)
+        if g.has_edge("summaries/doc1", "summaries/doc2"):
+            edge_data = g.get_edge_data("summaries/doc1", "summaries/doc2")
+            assert edge_data["edge_type"] != "entity_mention"
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +360,25 @@ class TestRelevance:
         score = relevance_score(g, "a", "b")
         expected_aa = 1.0 / math.log(2) * 1.5  # hub degree=2, log(2)
         assert abs(score - expected_aa) < 0.01
+
+    def test_entity_mention_signal(self):
+        from openkb.graph.relevance import relevance_score
+        import networkx as nx
+        g = nx.Graph()
+        g.add_node("p", entity_type="", sources=[], mentioned_entities=["OpenAI", "GPT"])
+        g.add_node("q", entity_type="", sources=[], mentioned_entities=["OpenAI", "LLM"])
+        # 1 shared entity -> 1 * 2.0 = 2.0
+        score = relevance_score(g, "p", "q")
+        assert score >= 2.0
+
+    def test_no_entity_mention_signal_without_overlap(self):
+        from openkb.graph.relevance import relevance_score
+        import networkx as nx
+        g = nx.Graph()
+        g.add_node("p", entity_type="", sources=[], mentioned_entities=["OpenAI"])
+        g.add_node("q", entity_type="", sources=[], mentioned_entities=["Google"])
+        score = relevance_score(g, "p", "q")
+        assert score < 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -475,6 +566,22 @@ class TestInsightsCLI:
         # Should not crash — may have 0 communities for small graph but no error
         assert result.exit_code == 0 or "No knowledge base" in result.output
 
+    def test_insights_reports_corruption(self, tmp_path):
+        from click.testing import CliRunner
+        from openkb.cli import cli
+        openkb_dir = tmp_path / ".openkb"
+        openkb_dir.mkdir()
+        # Write corrupted graph.json
+        (openkb_dir / "graph.json").write_text("{bad", encoding="utf-8")
+        # Also need a wiki dir for it to find the KB
+        wiki_dir = tmp_path / "wiki"
+        wiki_dir.mkdir()
+        (wiki_dir / "summaries").mkdir()
+        (wiki_dir / "concepts").mkdir()
+        runner = CliRunner()
+        result = runner.invoke(cli, ["--kb-dir", str(tmp_path), "insights"])
+        assert "손상" in result.output or "corrupt" in result.output.lower()
+
 
 # ---------------------------------------------------------------------------
 # search_related_pages (tools.py) tests
@@ -540,3 +647,14 @@ class TestSearchRelatedPages:
 
         result = search_related_pages("concepts/lonely", 5, str(tmp_path))
         assert "No related pages found" in result
+
+    def test_returns_korean_error_on_corrupted_graph(self, tmp_path):
+        """GraphLoadError in search_related_pages should return Korean message."""
+        from openkb.agent.tools import search_related_pages
+
+        openkb_dir = tmp_path / ".openkb"
+        openkb_dir.mkdir()
+        (openkb_dir / "graph.json").write_text("{invalid json", encoding="utf-8")
+
+        result = search_related_pages("concepts/alpha", 5, str(tmp_path))
+        assert "손상" in result

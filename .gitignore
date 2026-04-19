@@ -18,3 +18,4 @@ wiki/
 # Local only
 docs/
 .claude/
+.feature-workflow-*.json

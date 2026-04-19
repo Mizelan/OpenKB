@@ -69,6 +69,27 @@ class TestReviewItem:
         assert restored.search_queries == item.search_queries
         assert restored.options == item.options
 
+    def test_actionable_fields_roundtrip(self):
+        item = ReviewItem(
+            type="missing_page",
+            title="Missing Graph page",
+            description="Graph concept needs a placeholder",
+            source_path="summaries/graph.md",
+            action_type="create_placeholder",
+            payload={"path": "concepts/graph.md", "title": "Graph"},
+            status="pending",
+        )
+
+        data = item.to_dict()
+        assert data["action_type"] == "create_placeholder"
+        assert data["payload"] == {"path": "concepts/graph.md", "title": "Graph"}
+        assert data["status"] == "pending"
+
+        restored = ReviewItem.from_dict(data)
+        assert restored.action_type == "create_placeholder"
+        assert restored.payload == {"path": "concepts/graph.md", "title": "Graph"}
+        assert restored.status == "pending"
+
     def test_from_dict_minimal(self):
         d = {"type": "suggestion", "title": "T", "description": "D", "source_path": "s.md"}
         item = ReviewItem.from_dict(d)
@@ -79,6 +100,26 @@ class TestReviewItem:
         d = {"type": "bad", "title": "T", "description": "D", "source_path": "s.md"}
         with pytest.raises(ValueError):
             ReviewItem.from_dict(d)
+
+    def test_invalid_action_type_raises(self):
+        with pytest.raises(ValueError):
+            ReviewItem(
+                type="suggestion",
+                title="T",
+                description="D",
+                source_path="s.md",
+                action_type="promote_exploration",
+            )
+
+    def test_invalid_status_raises(self):
+        with pytest.raises(ValueError):
+            ReviewItem(
+                type="suggestion",
+                title="T",
+                description="D",
+                source_path="s.md",
+                status="done",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +221,7 @@ class TestReviewQueue:
         assert accepted.title == "A"
         assert len(q.list()) == 1
         assert q.list()[0].title == "B"
+        assert accepted.status == "accepted"
 
     def test_skip_removes_without_return(self, tmp_path):
         openkb_dir = tmp_path / ".openkb"
@@ -236,6 +278,143 @@ class TestReviewQueue:
         openkb_dir.mkdir()
         q = ReviewQueue(openkb_dir)
         assert q.list() == []
+
+    def test_queue_roundtrip_preserves_action_metadata_and_status(self, tmp_path):
+        openkb_dir = tmp_path / ".openkb"
+        openkb_dir.mkdir()
+        q = ReviewQueue(openkb_dir)
+        q.add([
+            ReviewItem(
+                type="missing_page",
+                title="Queue placeholder",
+                description="Needs a placeholder page",
+                source_path="summaries/source.md",
+                action_type="create_placeholder",
+                payload={"path": "concepts/queue-placeholder.md", "title": "Queue Placeholder"},
+                status="pending",
+            )
+        ])
+
+        loaded = ReviewQueue(openkb_dir).list()
+        assert len(loaded) == 1
+        assert loaded[0].action_type == "create_placeholder"
+        assert loaded[0].payload == {
+            "path": "concepts/queue-placeholder.md",
+            "title": "Queue Placeholder",
+        }
+        assert loaded[0].status == "pending"
+
+    @pytest.mark.parametrize(
+        ("action_type", "payload", "target_path", "expected_fragment", "seed_content"),
+        [
+            (
+                "create_placeholder",
+                {"path": "concepts/new-topic.md", "title": "New Topic"},
+                "concepts/new-topic.md",
+                "# New Topic",
+                None,
+            ),
+            (
+                "alias_concept",
+                {
+                    "path": "concepts/graph-alias.md",
+                    "alias": "Graph Alias",
+                    "target": "Graph Theory",
+                },
+                "concepts/graph-alias.md",
+                "[[Graph Theory]]",
+                None,
+            ),
+            (
+                "mark_stale",
+                {"path": "concepts/stale-topic.md", "reason": "Needs refresh"},
+                "concepts/stale-topic.md",
+                "Needs refresh",
+                "# Existing Topic\n",
+            ),
+        ],
+    )
+    def test_apply_review_action_supports_stage2_action_types(
+        self,
+        tmp_path,
+        action_type,
+        payload,
+        target_path,
+        expected_fragment,
+        seed_content,
+    ):
+        from openkb.review import apply_review_action
+
+        kb_dir = tmp_path / "kb"
+        target = kb_dir / "wiki" / target_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if seed_content is not None:
+            target.write_text(seed_content, encoding="utf-8")
+
+        item = ReviewItem(
+            type="suggestion",
+            title=f"{action_type} item",
+            description="Apply the suggested wiki change",
+            source_path="summaries/source.md",
+            action_type=action_type,
+            payload=payload,
+        )
+
+        changed_path = apply_review_action(kb_dir, item)
+
+        assert changed_path == target
+        assert target.exists()
+        assert expected_fragment in target.read_text(encoding="utf-8")
+
+    def test_apply_executes_action_and_removes_item_on_success(self, tmp_path):
+        from openkb.review import apply_review_action
+
+        kb_dir = tmp_path / "kb"
+        openkb_dir = kb_dir / ".openkb"
+        openkb_dir.mkdir(parents=True)
+        q = ReviewQueue(openkb_dir)
+        q.add([
+            ReviewItem(
+                type="missing_page",
+                title="Applied placeholder",
+                description="Create the missing page",
+                source_path="summaries/source.md",
+                action_type="create_placeholder",
+                payload={"path": "concepts/applied.md", "title": "Applied Topic"},
+            )
+        ])
+
+        applied = q.apply(0, lambda queued_item: apply_review_action(kb_dir, queued_item))
+
+        assert applied.status == "applied"
+        assert len(q.list()) == 0
+        assert (kb_dir / "wiki" / "concepts" / "applied.md").exists()
+
+    def test_apply_failure_keeps_pending_item(self, tmp_path):
+        from openkb.review import apply_review_action
+
+        kb_dir = tmp_path / "kb"
+        openkb_dir = kb_dir / ".openkb"
+        openkb_dir.mkdir(parents=True)
+        q = ReviewQueue(openkb_dir)
+        q.add([
+            ReviewItem(
+                type="suggestion",
+                title="Missing stale page",
+                description="Mark a missing page as stale",
+                source_path="summaries/source.md",
+                action_type="mark_stale",
+                payload={"path": "concepts/missing.md", "reason": "Needs refresh"},
+            )
+        ])
+
+        with pytest.raises(FileNotFoundError):
+            q.apply(0, lambda queued_item: apply_review_action(kb_dir, queued_item))
+
+        reloaded = ReviewQueue(openkb_dir).list()
+        assert len(reloaded) == 1
+        assert reloaded[0].title == "Missing stale page"
+        assert reloaded[0].status == "pending"
 
 
 # ---------------------------------------------------------------------------
