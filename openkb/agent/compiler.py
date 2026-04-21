@@ -26,6 +26,61 @@ from openkb.review import ReviewItem, parse_review_blocks, ReviewQueue
 
 logger = logging.getLogger(__name__)
 
+
+def _load_reject_list(kb_dir: Path) -> set[str]:
+    """Load rejected concept slugs from .openkb/concept-reject-list.json."""
+    reject_path = kb_dir / ".openkb" / "concept-reject-list.json"
+    if not reject_path.exists():
+        return set()
+    try:
+        data = json.loads(reject_path.read_text(encoding="utf-8"))
+        return set(data.get("rejected_slugs", []))
+    except (json.JSONDecodeError, OSError):
+        return set()
+
+
+def _fix_double_frontmatter(text: str) -> str:
+    """Fix files with two --- frontmatter blocks by keeping the real one.
+
+    Some corrupted files have a first block with a serialized brief containing
+    the second block's content, then a second block with actual frontmatter.
+    This finds the first block that has both ``sources:`` and ``brief:`` as
+    top-level keys and discards any preceding blocks.
+    """
+    blocks: list[tuple[str, int, int]] = []
+    idx = 0
+    while idx < len(text):
+        start = text.find("---", idx)
+        if start == -1:
+            break
+        # Skip the opening ---
+        after_start = start + 3
+        # Find closing ---
+        end = text.find("\n---", after_start)
+        if end == -1:
+            break
+        fm = text[after_start:end].strip()
+        block_end = end + 4  # past the closing ---
+        blocks.append((fm, start, block_end))
+        idx = block_end
+
+    if len(blocks) < 2:
+        return text
+
+    # Find first block with both sources and brief as top-level keys
+    real_idx = -1
+    for i, (fm, _, _) in enumerate(blocks):
+        if re.search(r"^sources:", fm, re.MULTILINE) and re.search(r"^brief:", fm, re.MULTILINE):
+            real_idx = i
+            break
+
+    if real_idx <= 0:
+        return text
+
+    real_fm = blocks[real_idx][0]
+    body = text[blocks[real_idx][2]:].lstrip("\n")
+    return f"---\n{real_fm}\n---\n{body}"
+
 # ---------------------------------------------------------------------------
 # Prompt templates
 # ---------------------------------------------------------------------------
@@ -92,7 +147,9 @@ Existing concept pages:
 Return a JSON object with three keys:
 
 1. "create" — new concepts not covered by any existing page. Array of objects:
-   {{"name": "concept-slug", "title": "Human-Readable Title", "entity_type": "person|organization|technology|concept|event|location|work"}}
+   {{"name": "concept-slug", "title": "Human-Readable Title", \
+"entity_type": "person|organization|technology|concept|event|location|work", \
+"significance": "high|medium"}}
 
 2. "update" — existing concepts that have significant new information from \
 this document worth integrating. Array of objects:
@@ -101,12 +158,23 @@ this document worth integrating. Array of objects:
 3. "related" — existing concepts tangentially related to this document but \
 not needing content changes, just a cross-reference link. Array of slug strings.
 
+Quality gate — do NOT create a concept unless it meets ALL of these:
+- Source centrality: the concept is a core focus of this document, not a \
+passing mention or minor example.
+- Independent value: the concept has enough substance to fill its own page \
+with non-trivial explanation, not just a definition.
+- Connection potential: the concept connects meaningfully to other existing \
+concepts or adds a genuinely new perspective to the knowledge base.
+If a concept fails any of these, put it in "related" instead of "create".
+
 Rules:
 - For the first few documents, create 2-3 foundational concepts at most.
 - Do NOT create a concept that overlaps with an existing one — use "update".
 - Do NOT create concepts that are just the document topic itself.
 - "related" is for lightweight cross-linking only, no content rewrite needed.
 - entity_type must be one of: person, organization, technology, concept, event, location, work
+- Only concepts with significance "high" should be created. \
+Medium-significance concepts go into "related".
 
 Return ONLY valid JSON, no fences, no explanation.
 """
@@ -185,7 +253,8 @@ def _fmt_messages(messages: list[dict], max_content: int = 200) -> str:
 
 def _llm_call(model: str, messages: list[dict], step_name: str, **kwargs) -> str:
     """Single LLM call via subprocess executor."""
-    from openkb.executor import ExecutorConfig, build_executor_config, run_llm_with_system
+    from openkb.executor import ExecutorConfig, build_executor_config, infer_provider_from_model, run_llm_with_system
+    from openkb.config import DEFAULT_CONFIG
     logger.debug("LLM request [%s]:\n%s", step_name, _fmt_messages(messages))
 
     # Build system and user prompts from messages list
@@ -203,7 +272,11 @@ def _llm_call(model: str, messages: list[dict], step_name: str, **kwargs) -> str
     # Determine provider from model name when no explicit config given
     cfg = kwargs.pop("executor_config", None)
     if cfg is None:
-        cfg = build_executor_config(model=model)
+        timeout = int(os.environ.get("OPENKB_TIMEOUT", DEFAULT_CONFIG.get("timeout", 600)))
+        provider = os.environ.get("OPENKB_PROVIDER", "") or DEFAULT_CONFIG.get("provider", "")
+        if not provider:
+            provider = infer_provider_from_model(model)
+        cfg = build_executor_config(model=model, provider=provider, timeout=timeout)
 
     result = run_llm_with_system(system_prompt, user_prompt, cfg)
 
@@ -278,6 +351,12 @@ def _clean_concept_content(content: str) -> str:
     # 7. Collapse multiple blank lines to max 2
     content = _re.sub(r'\n{3,}', '\n\n', content)
 
+    # 8. Remove file-path leakage from body (e.g. "sources/foo-bar.md." lines)
+    content = _re.sub(r'^(?:sources|summaries)/\S+\.md\.?\s*$', '', content, flags=_re.MULTILINE)
+
+    # 9. Remove "collectionstatus: failed" lines (LLM artifact)
+    content = _re.sub(r'^collectionstatus:\s*\w+\s*$', '', content, flags=_re.MULTILINE)
+
     return content.strip()
 
 
@@ -322,7 +401,7 @@ def _read_wiki_context(wiki_dir: Path) -> tuple[str, list[str]]:
     return index_content, existing
 
 
-def _read_concept_briefs(wiki_dir: Path) -> str:
+def _read_concept_briefs(wiki_dir: Path, max_concepts: int = 0, kb_dir: Path | None = None) -> str:
     """Read existing concept pages and return compact one-line summaries.
 
     For each concept, reads the ``brief:`` and ``entity_type:`` fields from
@@ -330,18 +409,29 @@ def _read_concept_briefs(wiki_dir: Path) -> str:
     first 150 chars of the body (newlines collapsed to spaces). Formats
     each as ``- {slug} [{entity_type}]: {brief}``.
 
+    When *max_concepts* > 0, only the most recently modified concepts
+    are included (by mtime), keeping the prompt compact for large wikis.
+
+    If *kb_dir* is provided, concepts on the reject list are excluded.
+
     Returns "(none yet)" if the concepts directory is missing or empty.
     """
     concepts_dir = wiki_dir / "concepts"
     if not concepts_dir.exists():
         return "(none yet)"
 
+    reject_slugs = _load_reject_list(kb_dir) if kb_dir else set()
+
     md_files = sorted(concepts_dir.glob("*.md"))
+    if max_concepts > 0:
+        md_files = sorted(md_files, key=lambda p: p.stat().st_mtime, reverse=True)[:max_concepts]
     if not md_files:
         return "(none yet)"
 
     lines: list[str] = []
     for path in md_files:
+        if path.stem in reject_slugs:
+            continue
         text = path.read_text(encoding="utf-8")
         brief = ""
         entity_type = ""
@@ -534,6 +624,21 @@ def _summary_brief_from_body(body: str) -> str:
     return brief[:100]
 
 
+def _write_stub_summary(wiki_dir: Path, doc_name: str, reason: str) -> None:
+    """Write a minimal placeholder summary for documents that failed quality gate."""
+    summaries_dir = wiki_dir / "summaries"
+    summaries_dir.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "doc_type": "short",
+        "full_text": f"sources/{doc_name}.md",
+        "brief": f"수집 불가 — {reason}",
+        "compilation_status": "skipped",
+    }
+    body = f"# 수집 불가\n\n이 문서는 내용이 부족해 요약을 생략했습니다 ({reason}).\n"
+    path = summaries_dir / f"{doc_name}.md"
+    path.write_text(serialize_fm(meta, body), encoding="utf-8")
+
+
 def _embedded_json_brief(body: str) -> str:
     """Extract a brief from legacy JSON-shaped concept content if present."""
     text = body.lstrip()
@@ -577,12 +682,16 @@ def _analyze_document(
     system_msg: dict,
     doc_msg: dict,
     concept_briefs: str,
+    executor_config: object | None = None,
 ) -> dict:
     """Run the analysis step and return entities, concept_actions, and review_items.
 
     Returns a dict with keys: entities, concept_actions, review_items.
     On failure (bad JSON, LLM error), returns empty defaults.
     """
+    kwargs = {}
+    if executor_config is not None:
+        kwargs["executor_config"] = executor_config
     analysis_raw = _llm_call(model, [
         system_msg,
         doc_msg,
@@ -590,7 +699,7 @@ def _analyze_document(
             concept_briefs=concept_briefs,
             content=doc_msg["content"],
         )},
-    ], "analysis")
+    ], "analysis", **kwargs)
 
     try:
         parsed = _parse_json(analysis_raw)
@@ -620,6 +729,45 @@ def _analyze_document(
     }
 
 
+def _is_valid_brief(brief: str) -> bool:
+    """Return False if brief is a corrupted value (file path, numeric, JSON artifact)."""
+    if not brief:
+        return False
+    b = brief.strip().strip("'\"")
+    if not b:
+        return False
+    # File path leakage (e.g. "sources/foo-bar.md.")
+    if b.startswith(("sources/", "summaries/")):
+        return False
+    # Numeric-only (e.g. "2.", "3")
+    if re.match(r"^\d+(\.\d*)?\.?$", b):
+        return False
+    # JSON artifact (e.g. '"content": "..."')
+    if b.startswith('"content":') or b.startswith('"brief":'):
+        return False
+    return True
+
+
+def _assess_source_quality(content: str) -> tuple[bool, str]:
+    """Quick structural check before expensive LLM calls.
+
+    Returns (is_compile_worthy, reason). When not compile-worthy,
+    a stub summary is written and compilation stops.
+    Only catches obviously empty/meaningless sources — the LLM handles
+    the substantive quality gate (centrality, independent value, connections).
+    """
+    body = content
+    if content.startswith("---"):
+        parts = content.split("---", 2)
+        body = parts[2].strip() if len(parts) >= 3 else content
+
+    body = body.strip()
+    if not body:
+        return False, "empty body"
+
+    return True, ""
+
+
 def _write_concept(
     wiki_dir: Path,
     name: str,
@@ -645,6 +793,8 @@ def _write_concept(
 
     if is_update and path.exists():
         existing = path.read_text(encoding="utf-8")
+        # Fix double frontmatter: if file has two --- blocks, keep the second (real) one
+        existing = _fix_double_frontmatter(existing)
         meta, _ = parse_fm(existing)
         meta["sources"] = _dedupe_strings(_as_string_list(meta.get("sources")) + [source_file])
         meta.update(
@@ -655,8 +805,10 @@ def _write_concept(
                 previous_meta=meta,
             )
         )
-        if brief:
+        if _is_valid_brief(brief):
             meta["brief"] = brief
+        elif brief:
+            logger.warning("Skipping corrupted brief for concept %s: %r", safe_name, brief[:60])
         if entity_type:
             meta["entity_type"] = entity_type
         path.write_text(serialize_fm(meta, clean_body), encoding="utf-8")
@@ -669,8 +821,10 @@ def _write_concept(
                 supporting_pages=[supporting_page or source_file],
             )
         )
-        if brief:
+        if _is_valid_brief(brief):
             meta["brief"] = brief
+        elif brief:
+            logger.warning("Skipping corrupted brief for concept %s: %r", safe_name, brief[:60])
         if entity_type:
             meta["entity_type"] = entity_type
         path.write_text(serialize_fm(meta, clean_body), encoding="utf-8")
@@ -851,6 +1005,8 @@ async def _compile_concepts(
     doc_type: str = "short",
     language: str = "en",
     analysis_context: dict | None = None,
+    concept_briefs: str | None = None,
+    executor_config: object | None = None,
 ) -> None:
     """Shared Steps 2-4: concepts plan → generate/update → index.
 
@@ -864,10 +1020,10 @@ async def _compile_concepts(
     supporting_source = _summary_source_path(doc_name, doc_type)
 
     # --- Step 2: Get concepts plan (A cached) ---
-    concept_briefs = _read_concept_briefs(wiki_dir)
+    briefs = concept_briefs or _read_concept_briefs(wiki_dir, kb_dir=kb_dir)
 
     # Build concept plan prompt, optionally with analysis context
-    plan_prompt = _CONCEPTS_PLAN_USER.format(concept_briefs=concept_briefs)
+    plan_prompt = _CONCEPTS_PLAN_USER.format(concept_briefs=briefs)
     if analysis_context and analysis_context.get("concept_actions"):
         actions_text = "\n".join(
             f"- {a.get('action', '?')}: {a.get('name', '?')} — {a.get('reason', '')}"
@@ -875,12 +1031,15 @@ async def _compile_concepts(
         )
         plan_prompt = f"Prior analysis suggests the following concept actions:\n{actions_text}\n\n{plan_prompt}"
 
+    _llm_kwargs = {}
+    if executor_config is not None:
+        _llm_kwargs["executor_config"] = executor_config
     plan_raw = _llm_call(model, [
         system_msg,
         doc_msg,
         {"role": "assistant", "content": summary},
         {"role": "user", "content": plan_prompt},
-    ], "concepts-plan", max_tokens=1024)
+    ], "concepts-plan", max_tokens=1024, **_llm_kwargs)
 
     try:
         parsed = _parse_json(plan_raw)
@@ -901,9 +1060,29 @@ async def _compile_concepts(
         }
 
     # Filter out non-dict items from create/update lists (LLM may return malformed items)
-    create_items = [c for c in plan["create"] if isinstance(c, dict)]
-    update_items = [c for c in plan["update"] if isinstance(c, dict)]
-    related_items = [r for r in plan["related"] if isinstance(r, str)]
+    # Demote medium-significance concepts to "related" (only high significance gets a page)
+    # Skip concepts on the reject list (previously deemed too low-quality)
+    reject_slugs = _load_reject_list(kb_dir)
+    raw_create = [c for c in plan["create"] if isinstance(c, dict)]
+    demoted_related: list[str] = []
+    create_items = []
+    for c in raw_create:
+        name = c.get("name") or c.get("title") or ""
+        slug = _sanitize_concept_name(name)
+        if slug in reject_slugs:
+            logger.info("Skipping rejected concept: %s", slug)
+            continue
+        sig = str(c.get("significance", "high")).lower().strip()
+        if sig in ("medium", "low"):
+            if slug:
+                demoted_related.append(slug)
+        else:
+            create_items.append(c)
+    update_items = [c for c in plan["update"] if isinstance(c, dict)
+                    if _sanitize_concept_name(c.get("name") or c.get("title") or "") not in reject_slugs]
+    raw_related = [r for r in plan["related"] if isinstance(r, str)]
+    related_items = [_sanitize_concept_name(r) for r in raw_related
+                     if _sanitize_concept_name(r) not in reject_slugs] + demoted_related
 
     if not create_items and not update_items and not related_items:
         _update_index(wiki_dir, doc_name, [], doc_brief=doc_brief, doc_type=doc_type, language=language)
@@ -918,9 +1097,8 @@ async def _compile_concepts(
         entity_type = concept.get("entity_type", "")
         async with semaphore:
             raw = await _llm_call_async(model, [
-                system_msg,
-                doc_msg,
-                {"role": "assistant", "content": summary},
+                {"role": "system", "content": system_msg["content"]},
+                {"role": "user", "content": summary},
                 {"role": "user", "content": _CONCEPT_PAGE_USER.format(
                     title=title, doc_name=doc_name,
                     update_instruction="",
@@ -953,9 +1131,8 @@ async def _compile_concepts(
             existing_content = "(page not found — create from scratch)"
         async with semaphore:
             raw = await _llm_call_async(model, [
-                system_msg,
-                doc_msg,
-                {"role": "assistant", "content": summary},
+                {"role": "system", "content": system_msg["content"]},
+                {"role": "user", "content": summary},
                 {"role": "user", "content": _CONCEPT_UPDATE_USER.format(
                     title=title, doc_name=doc_name,
                     existing_content=existing_content,
@@ -1001,8 +1178,11 @@ async def _compile_concepts(
                 concept_briefs_map[safe_name] = brief
 
     # --- Step 3b: Process related items (code only, no LLM) ---
-    sanitized_related = [_sanitize_concept_name(s) for s in related_items]
+    # related_items already has reject-list slugs filtered out
+    sanitized_related = related_items
     for slug in sanitized_related:
+        if slug in reject_slugs:
+            continue
         _add_related_link(wiki_dir, slug, doc_name, source_file)
 
     # --- Step 3c: Backlink — summary ↔ concepts (code only) ---
@@ -1049,6 +1229,18 @@ async def compile_short_doc(
     config = load_config(openkb_dir / "config.yaml")
     language: str = config.get("language", "en")
 
+    # Ensure provider/timeout from config are available to _llm_call
+    if config.get("provider") and not os.environ.get("OPENKB_PROVIDER"):
+        os.environ["OPENKB_PROVIDER"] = config["provider"]
+    if config.get("timeout") and not os.environ.get("OPENKB_TIMEOUT"):
+        os.environ["OPENKB_TIMEOUT"] = str(config["timeout"])
+
+    # Build a shared ExecutorConfig for session reuse across LLM calls
+    from openkb.executor import build_executor_config, infer_provider_from_model
+    timeout = int(os.environ.get("OPENKB_TIMEOUT", config.get("timeout", 600)))
+    provider = os.environ.get("OPENKB_PROVIDER", "") or config.get("provider", "") or infer_provider_from_model(model)
+    _shared_cfg = build_executor_config(model=model, provider=provider, timeout=timeout)
+
     wiki_dir = kb_dir / "wiki"
     schema_md = get_agents_md(wiki_dir)
     summary_only = os.environ.get("OPENKB_SUMMARY_ONLY") == "1"
@@ -1060,6 +1252,7 @@ async def compile_short_doc(
     )}
 
     analysis: dict = {}
+    concept_briefs: str | None = None
     if concepts_only:
         _, summary, doc_brief = _load_existing_summary(wiki_dir, doc_name)
         doc_msg = {"role": "user", "content": _CONCEPTS_ONLY_DOC_CONTEXT_USER.format(
@@ -1067,18 +1260,29 @@ async def compile_short_doc(
         )}
     else:
         content = source_path.read_text(encoding="utf-8")
+
+        # Source quality gate: skip compilation for thin/empty documents
+        compile_worthy, skip_reason = _assess_source_quality(content)
+        if not compile_worthy:
+            sys.stdout.write(f"    Skipping: source too thin ({skip_reason})\n")
+            sys.stdout.flush()
+            _write_stub_summary(wiki_dir, doc_name, skip_reason)
+            _update_index(wiki_dir, doc_name, [], doc_type="short", language=language)
+            return
+
         doc_msg = {"role": "user", "content": _SUMMARY_USER.format(
             doc_name=doc_name, content=content,
         )}
 
-        if not summary_only:
+        if not summary_only and os.environ.get("OPENKB_SKIP_ANALYSIS") != "1":
             # --- Step 0: Analysis step ---
-            concept_briefs = _read_concept_briefs(wiki_dir)
+            concept_briefs = _read_concept_briefs(wiki_dir, max_concepts=50, kb_dir=kb_dir)
             analysis = _analyze_document(
                 model=model,
                 system_msg=system_msg,
                 doc_msg=doc_msg,
                 concept_briefs=concept_briefs,
+                executor_config=_shared_cfg,
             )
 
             # Save review items to queue
@@ -1089,11 +1293,13 @@ async def compile_short_doc(
                 queue.add(review_items)
 
         # --- Step 1: Generate summary ---
-        summary_raw = _llm_call(model, [system_msg, doc_msg], "summary")
+        summary_raw = _llm_call(model, [system_msg, doc_msg], "summary", executor_config=_shared_cfg)
         try:
             summary_parsed = _parse_json(summary_raw)
             if isinstance(summary_parsed, dict):
                 doc_brief = summary_parsed.get("brief", "")
+                if not _is_valid_brief(doc_brief):
+                    doc_brief = ""
                 summary = _clean_concept_content(summary_parsed.get("content", summary_raw))
             else:
                 raise ValueError("summary response was not a JSON object")
@@ -1111,6 +1317,8 @@ async def compile_short_doc(
         summary, doc_name, max_concurrency, doc_brief=doc_brief,
         doc_type="short", language=language,
         analysis_context=analysis if analysis.get("concept_actions") else None,
+        concept_briefs=concept_briefs if not summary_only else None,
+        executor_config=_shared_cfg,
     )
 
 
@@ -1134,6 +1342,18 @@ async def compile_long_doc(
     config = load_config(openkb_dir / "config.yaml")
     language: str = config.get("language", "en")
 
+    # Ensure provider/timeout from config are available to _llm_call
+    if config.get("provider") and not os.environ.get("OPENKB_PROVIDER"):
+        os.environ["OPENKB_PROVIDER"] = config["provider"]
+    if config.get("timeout") and not os.environ.get("OPENKB_TIMEOUT"):
+        os.environ["OPENKB_TIMEOUT"] = str(config["timeout"])
+
+    # Build a shared ExecutorConfig for session reuse across LLM calls
+    from openkb.executor import build_executor_config, infer_provider_from_model
+    timeout = int(os.environ.get("OPENKB_TIMEOUT", config.get("timeout", 600)))
+    provider = os.environ.get("OPENKB_PROVIDER", "") or config.get("provider", "") or infer_provider_from_model(model)
+    _shared_cfg = build_executor_config(model=model, provider=provider, timeout=timeout)
+
     wiki_dir = kb_dir / "wiki"
     schema_md = get_agents_md(wiki_dir)
     summary_content = summary_path.read_text(encoding="utf-8")
@@ -1146,6 +1366,7 @@ async def compile_long_doc(
     )}
 
     analysis: dict = {}
+    concept_briefs: str | None = None
     if concepts_only:
         _, overview = parse_fm(summary_content)
         doc_msg = {"role": "user", "content": _CONCEPTS_ONLY_DOC_CONTEXT_USER.format(
@@ -1158,14 +1379,15 @@ async def compile_long_doc(
             doc_name=doc_name, doc_id=doc_id, content=summary_content,
         )}
 
-        if not summary_only:
+        if not summary_only and os.environ.get("OPENKB_SKIP_ANALYSIS") != "1":
             # --- Step 0: Analysis step ---
-            concept_briefs = _read_concept_briefs(wiki_dir)
+            concept_briefs = _read_concept_briefs(wiki_dir, max_concepts=50, kb_dir=kb_dir)
             analysis = _analyze_document(
                 model=model,
                 system_msg=system_msg,
                 doc_msg=doc_msg,
                 concept_briefs=concept_briefs,
+                executor_config=_shared_cfg,
             )
 
             # Save review items to queue
@@ -1176,7 +1398,7 @@ async def compile_long_doc(
                 queue.add(review_items)
 
         # --- Step 1: Generate overview ---
-        overview = _llm_call(model, [system_msg, doc_msg], "overview")
+        overview = _llm_call(model, [system_msg, doc_msg], "overview", executor_config=_shared_cfg)
 
     if summary_only:
         return
@@ -1187,4 +1409,6 @@ async def compile_long_doc(
         overview, doc_name, max_concurrency, doc_brief=doc_description,
         doc_type="pageindex", language=language,
         analysis_context=analysis if analysis.get("concept_actions") else None,
+        concept_briefs=concept_briefs if not summary_only else None,
+        executor_config=_shared_cfg,
     )

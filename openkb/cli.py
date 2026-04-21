@@ -197,7 +197,12 @@ def _normalize_background_insights_cooldown(raw_value: object) -> int:
 
 
 def _trigger_background_insights_after_add(kb_dir: Path) -> None:
-    """Start cooldown-gated insights refresh after a successful add."""
+    """Start cooldown-gated insights refresh after a successful add.
+
+    Skipped when ``OPENKB_DEFER_INSIGHTS=1`` is set (batch mode).
+    """
+    if os.environ.get("OPENKB_DEFER_INSIGHTS") == "1":
+        return
     maybe_trigger_insights(kb_dir)
 
 
@@ -417,10 +422,19 @@ def add(ctx, path):
             return
         total = len(files)
         click.echo(f"Found {total} supported file(s) in {path}.")
-        for i, f in enumerate(files, 1):
-            click.echo(f"\n[{i}/{total}] ", nl=False)
-            if add_single_file(f, kb_dir):
-                _trigger_background_insights_after_add(kb_dir)
+        # Defer insights during batch — trigger once after all files.
+        prev_defer = os.environ.get("OPENKB_DEFER_INSIGHTS")
+        os.environ["OPENKB_DEFER_INSIGHTS"] = "1"
+        try:
+            for i, f in enumerate(files, 1):
+                click.echo(f"\n[{i}/{total}] ", nl=False)
+                add_single_file(f, kb_dir)
+        finally:
+            if prev_defer is None:
+                os.environ.pop("OPENKB_DEFER_INSIGHTS", None)
+            else:
+                os.environ["OPENKB_DEFER_INSIGHTS"] = prev_defer
+        _trigger_background_insights_after_add(kb_dir)
     else:
         if target.suffix.lower() not in SUPPORTED_EXTENSIONS:
             click.echo(
@@ -531,18 +545,28 @@ def add_sources(ctx, source_dir, source_type_filter, max_count, dry_run, max_wor
 
     items = [(i, url, stype, src_file) for i, (url, stype, src_file) in enumerate(urls_to_add, 1)]
 
-    if max_workers > 1:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        click.echo(f"Using {max_workers} parallel workers.")
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = {pool.submit(_process_one, item): item for item in items}
-            for future in as_completed(futures):
-                result = future.result()
+    # Defer insights during batch — trigger once after all URLs.
+    prev_defer = os.environ.get("OPENKB_DEFER_INSIGHTS")
+    os.environ["OPENKB_DEFER_INSIGHTS"] = "1"
+    try:
+        if max_workers > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            click.echo(f"Using {max_workers} parallel workers.")
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {pool.submit(_process_one, item): item for item in items}
+                for future in as_completed(futures):
+                    result = future.result()
+                    click.echo(result)
+        else:
+            for item in items:
+                result = _process_one(item)
                 click.echo(result)
-    else:
-        for item in items:
-            result = _process_one(item)
-            click.echo(result)
+    finally:
+        if prev_defer is None:
+            os.environ.pop("OPENKB_DEFER_INSIGHTS", None)
+        else:
+            os.environ["OPENKB_DEFER_INSIGHTS"] = prev_defer
+    _trigger_background_insights_after_add(kb_dir)
 
 
 @cli.command()

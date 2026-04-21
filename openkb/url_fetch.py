@@ -510,11 +510,41 @@ def fetch_url(url: str) -> tuple[str, str]:
     :func:`fetch_article` for everything else.
 
     Raises:
-        FetchError: on any fetch failure
+        FetchError: on any fetch failure or if content is too thin
     """
     url = canonicalize_url(url)
     kind = classify_url(url)
     if kind == "twitter":
-        return fetch_tweet(url)
-    # youtube and article both use the same HTML fetch path for now
-    return fetch_article(url)
+        markdown, slug = fetch_tweet(url)
+    else:
+        # youtube and article both use the same HTML fetch path for now
+        markdown, slug = fetch_article(url)
+
+    _validate_content_depth(markdown, url, kind)
+    return markdown, slug
+
+
+def _validate_content_depth(markdown: str, url: str, kind: str) -> None:
+    """Raise FetchError if fetched content is too thin to be useful.
+
+    Thresholds:
+    - Twitter: 5 words minimum (filters reaction-only tweets)
+    - YouTube: 30 words minimum (detects footer-only collection failures)
+    - Other: 30 words minimum (detects empty/paywalled/blocked pages)
+    """
+    # Strip YAML frontmatter before counting
+    body = re.sub(r"^---\n.*?\n---\n?", "", markdown, flags=re.DOTALL).strip()
+    # Strip URL lines at the end
+    body = re.sub(r"\n---\nURL:.*$", "", body, flags=re.DOTALL).strip()
+    word_count = len(body.split())
+
+    if kind == "twitter":
+        min_words = 5
+    else:
+        min_words = 30
+
+    if word_count < min_words:
+        raise FetchError(
+            f"Content too thin ({word_count} words, minimum {min_words}): {url}. "
+            f"Source may be a reaction-only tweet, paywalled article, or collection failure."
+        )

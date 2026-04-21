@@ -13,6 +13,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "pageindex_threshold": 20,
     "insights_cooldown": 3600,
     "background_insights_cooldown_seconds": 3600,
+    "timeout": 600,
 }
 
 GLOBAL_CONFIG_DIR = Path.home() / ".config" / "openkb"

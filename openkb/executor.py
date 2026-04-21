@@ -41,6 +41,7 @@ class ExecutorConfig:
     effort: str = "medium"         # low | medium | high
     working_dir: str = ""          # working directory for subprocess
     timeout: int = 300             # seconds
+    session_id: str = ""           # codex_app session ID for resume
     # Ollama-specific
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_auth_token: str = "ollama"
@@ -409,7 +410,15 @@ class BaseExecutor(ABC):
                 error=f"Exit code {proc.returncode}: {proc.stderr[:500]}",
             )
 
-        return self.parse_output(proc.stdout)
+        result = self.parse_output(proc.stdout)
+
+        # Auto-detect session_id from first call for resume support
+        if not self.cfg.session_id and hasattr(self, "_extract_session_id"):
+            sid = self._extract_session_id(proc.stdout)
+            if sid:
+                self.cfg.session_id = sid
+
+        return result
 
     def run_streaming(
         self,
@@ -537,11 +546,22 @@ class CodexExecutor(BaseExecutor):
 
 
 class CodexAppExecutor(BaseExecutor):
-    """Codex App executor using `codex exec --json` with structured output."""
+    """Codex App executor using `codex exec --json` with structured output.
+
+    When ``cfg.session_id`` is set, subsequent calls use ``codex exec resume``
+    to reuse the session, enabling prompt caching across calls.
+    """
     provider_name = "codex_app"
     binary_name = "codex"
 
     def build_args(self, prompt: str) -> list[str]:
+        if self.cfg.session_id:
+            return [
+                "exec", "resume", "--json",
+                "-m", self.cfg.effective_model,
+                self.cfg.session_id,
+                prompt,
+            ]
         return [
             "exec", "--json",
             "-m", self.cfg.effective_model,
@@ -553,6 +573,20 @@ class CodexAppExecutor(BaseExecutor):
 
     def parse_stream(self, lines: Iterable[str], on_text_delta: TextDeltaCallback | None = None) -> LLMResult:
         return _collect_codex_app_stream(lines, self.cfg.effective_model, on_text_delta)
+
+    def _extract_session_id(self, stdout: str) -> str | None:
+        """Extract thread_id from codex exec --json output."""
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+                if event.get("type") == "thread.started":
+                    return event.get("thread_id")
+            except json.JSONDecodeError:
+                continue
+        return None
 
 
 class OllamaExecutor(ClaudeExecutor):
