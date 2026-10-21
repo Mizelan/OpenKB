@@ -6,6 +6,56 @@
 
 # OpenKB — Open LLM Knowledge Base
 
+## At a glance
+
+OpenKB is a CLI that compiles raw documents into a persistent, interlinked Markdown wiki using LLM subprocess executors, then answers questions by navigating that wiki with PageIndex instead of a vector database.
+
+**Features**
+
+- Ingests PDF, Word, Markdown, PowerPoint, HTML, Excel, and text through markitdown.
+- LLM-compiled summaries, concept pages, and cross-links under `.openkb/`, kept current by refresh and watch mode.
+- One-shot `query`, multi-turn `chat` with resumable sessions, and a `quality` loop.
+- Structural and knowledge health checks (`lint`) plus contradiction/gap/orphan review.
+- Obsidian-compatible output: plain `.md` with `[[wikilinks]]`.
+
+**Tools**
+
+| Command | What it does |
+| --- | --- |
+| `openkb init` | Initialize a knowledge base (interactive) |
+| `openkb add <path>` | Convert and ingest a file or directory |
+| `openkb add-sources` | Ingest a source directory with type filters and workers |
+| `openkb query "<question>"` | One-shot question against the wiki |
+| `openkb chat` | Multi-turn chat (`--resume`, `--list`, `--delete`) |
+| `openkb watch` | Watch `raw/` and auto-compile new files |
+| `openkb lint` | Structural + knowledge health checks |
+| `openkb quality` | Quality loop over compiled pages |
+| `openkb refresh` | Refresh stale pages (`--plan-only`) |
+| `openkb review` | Review/accept/apply proposed changes |
+| `openkb promote` | Promote a page between modes |
+| `openkb list`, `openkb status`, `openkb insights` | Inventory and statistics |
+| `openkb use <path>` | Select the active knowledge base |
+
+**Layout**
+
+| Path | Contents |
+| --- | --- |
+| `openkb/` | Package: CLI, converter, agent, graph, indexer, lint, watcher, review |
+| `tests/` | Pytest suite |
+| `examples/` | Example inputs and docs |
+| `docs/` | Port and phase plans |
+| `scripts/build-and-install.sh` | Local build/install helper |
+| `config.yaml.example` | Model, language, and PageIndex settings |
+
+**Run**
+
+```bash
+pip install openkb
+openkb init
+openkb add paper.pdf
+openkb query "What are the main findings?"
+```
+
 <p align="center"><i>Scale to long documents&nbsp; • &nbsp;Reasoning-based retrieval&nbsp; • &nbsp;Native multi-modality&nbsp; • &nbsp;No Vector DB</i></p>
 
 </div>
